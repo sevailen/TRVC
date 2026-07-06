@@ -1,0 +1,2 @@
+const int B = 7;
+int main(){ return B + 1; }

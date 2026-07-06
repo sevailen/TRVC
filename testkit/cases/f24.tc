@@ -1,0 +1,3 @@
+int r = 0;
+void setr(int x){ r = x; return; }
+int main(){ setr(9); return r; }

@@ -23,7 +23,8 @@ type terminator =
   | TBranch of reg * label * label
 
 type block = { label : label; body : tac list; term : terminator }
-type func_cfg = { name : string; ret_ty : ty; entry : label; blocks : block list }
+type func_cfg = { name : string; ret_ty : ty; entry : label;
+                  blocks : block list; num_slots : int; num_params : int }
 type program_cfg = { functions : func_cfg list; globals : (string * int) list }
 
 type block_segment =
@@ -31,6 +32,9 @@ type block_segment =
   | TacSeg of tac
 
 type loop_ctx = { break_lbl : label; continue_lbl : label }
+
+(* fp-relative offset of local/param slot k (locals start right below saved ra/fp) *)
+let slot_off (k : int) : int = -(12 + 4 * k)
 
 (* ================================================================= *)
 (*  DAG processing (must come before builder that calls them)        *)
@@ -87,183 +91,194 @@ let process_segments segments =
 (*  Builder state                                                    *)
 (* ================================================================= *)
 
+(* Variable binding kinds resolved by the CFG builder *)
+type binding =
+  | Slot of int        (* local var / param: fp-relative stack slot index *)
+  | ConstB of int      (* compile-time constant value *)
+  | GlobalB of string  (* global variable: addressed by symbol name *)
+
 type builder_state = {
   mutable cur_label : label;
   mutable cur_body : block_segment list;
   mutable blocks : block list;
+  mutable block_open : bool;                (* is cur block awaiting a terminator? *)
   mutable functions : func_cfg list;
   mutable loop_stack : loop_ctx list;
-  symbols : Symbol.t;
-  mutable stack_slots : (string, int) Hashtbl.t;
+  mutable scopes : (string, binding) Hashtbl.t list;  (* innermost first *)
   mutable next_slot : int;
-  mutable var_env : (string * reg) list;
-  mutable globals : (string * int) list;
+  mutable max_slots : int;
 }
 
 let fresh_label (_st : builder_state) = Util.fresh_label "L"
 
-let emit_tac st t = st.cur_body <- st.cur_body @ [TacSeg t]
-
-let emit_pure (st : builder_state) (env : (string * reg) list) (e : expr) : reg =
-  match e with
-  | Var x -> (match List.assoc_opt x env with Some r -> r
-              | None -> failwith ("Unbound: " ^ x))
-  | _ ->
-    let r = Util.fresh_reg () in
-    st.cur_body <- st.cur_body @ [PureSeg {reg=r; expr=e; env}]; r
-
-let finish_block (st : builder_state) (term : terminator) : unit =
-  let body = process_segments st.cur_body in
-  st.blocks <- {label=st.cur_label; body; term} :: st.blocks;
-  st.cur_body <- []; st.cur_label <- fresh_label st
-
-let start_new_block (st : builder_state) (lbl : label) : unit =
-  st.cur_label <- lbl; st.cur_body <- []
-
-(* ================================================================= *)
-(*  Variable stack allocation                                        *)
-(* ================================================================= *)
+(* --- scope management --- *)
+let push_scope (st : builder_state) = st.scopes <- Hashtbl.create 16 :: st.scopes
+let pop_scope (st : builder_state) =
+  match st.scopes with _ :: rest -> st.scopes <- rest | [] -> ()
+let bind (st : builder_state) name b =
+  match st.scopes with cur :: _ -> Hashtbl.replace cur name b | [] -> ()
+let rec resolve_in name = function
+  | [] -> None
+  | sc :: rest -> (match Hashtbl.find_opt sc name with Some b -> Some b | None -> resolve_in name rest)
+let resolve (st : builder_state) name = resolve_in name st.scopes
 
 let alloc_stack_slot (st : builder_state) (name : string) : int =
   let slot = st.next_slot in
   st.next_slot <- slot + 1;
-  Hashtbl.add st.stack_slots name slot; slot
+  if st.next_slot > st.max_slots then st.max_slots <- st.next_slot;
+  bind st name (Slot slot); slot
 
-let get_stack_slot (st : builder_state) (name : string) : int =
-  match Hashtbl.find_opt st.stack_slots name with
-  | Some s -> s | None -> failwith ("no stack slot for " ^ name)
+(* --- block emission --- *)
+let ensure_open (st : builder_state) =
+  if not st.block_open then begin
+    st.cur_label <- fresh_label st; st.cur_body <- []; st.block_open <- true
+  end
+
+let emit_tac st t = ensure_open st; st.cur_body <- st.cur_body @ [TacSeg t]
+
+let emit_pure (st : builder_state) (env : (string * reg) list) (e : expr) : reg =
+  ensure_open st;
+  let r = Util.fresh_reg () in
+  st.cur_body <- st.cur_body @ [PureSeg {reg=r; expr=e; env}]; r
+
+let finish_block (st : builder_state) (term : terminator) : unit =
+  if st.block_open then begin
+    let body = process_segments st.cur_body in
+    st.blocks <- {label=st.cur_label; body; term} :: st.blocks;
+    st.cur_body <- []; st.block_open <- false
+  end
+
+let start_new_block (st : builder_state) (lbl : label) : unit =
+  st.cur_label <- lbl; st.cur_body <- []; st.block_open <- true
+
+(* ================================================================= *)
+(*  Compile-time constant evaluation (local consts, over builder scope) *)
+(* ================================================================= *)
+
+let rec eval_const_b (st : builder_state) (e : expr) : int =
+  match e with
+  | IntLit n -> n
+  | Var x ->
+    (match resolve st x with
+     | Some (ConstB n) -> n
+     | _ -> failwith ("Semantic error: undefined variable '" ^ x ^ "'"))
+  | Unop (Neg, e1) -> - (eval_const_b st e1)
+  | Unop (Not, e1) -> if eval_const_b st e1 = 0 then 1 else 0
+  | Unop (Pos, e1) -> eval_const_b st e1
+  | Binop (op, e1, e2) -> Dag.eval_const_binop op (eval_const_b st e1) (eval_const_b st e2)
+  | _ -> failwith "non-constant expression in const context"
+
+(* ================================================================= *)
+(*  Named-value load/store (slot / const / global) — all expr paths   *)
+(* ================================================================= *)
+
+let load_named (st : builder_state) (name : string) : reg =
+  match resolve st name with
+  | Some (Slot k) ->
+    let r = Util.fresh_reg () in emit_tac st (TLoad (r, 8, slot_off k)); r
+  | Some (ConstB n) ->
+    let r = Util.fresh_reg () in emit_tac st (TConst (r, n)); r
+  | Some (GlobalB g) ->
+    let r = Util.fresh_reg () in
+    emit_tac st (TLa (r, g)); emit_tac st (TLoad (r, r, 0)); r
+  | None -> failwith ("no stack slot for " ^ name)
+
+let store_named (st : builder_state) (name : string) (r : reg) : unit =
+  match resolve st name with
+  | Some (Slot k) -> emit_tac st (TStore (8, slot_off k, r))
+  | Some (GlobalB g) ->
+    let tmp = Util.fresh_reg () in
+    emit_tac st (TLa (tmp, g)); emit_tac st (TStore (tmp, 0, r))
+  | Some (ConstB _) -> failwith ("cannot assign to const '" ^ name ^ "'")
+  | None -> failwith ("no stack slot for " ^ name)
 
 (* ================================================================= *)
 (*  Expression builder                                               *)
 (* ================================================================= *)
 
-(** Check if expression is pure (no function calls) *)
+(** Check if expression is pure: no calls AND no short-circuit ops.
+    &&/|| must never be folded into the DAG or they lose short-circuit semantics
+    (e.g. `x!=0 && 100/x>5` would divide by zero when x=0). *)
 let rec is_pure = function
   | Call _ | Assign _ -> false
+  | Binop (And, _, _) | Binop (Or, _, _) -> false
   | Binop (_, e1, e2) -> is_pure e1 && is_pure e2
   | Unop (_, e1) -> is_pure e1
   | _ -> true
 
-let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) : reg =
+(* Collect variable names referenced in a pure expr and preload each into a reg. *)
+let preload_vars (st : builder_state) (e : expr) : (string * reg) list =
+  let names = ref [] in
+  let rec find = function
+    | Var x -> if not (List.mem x !names) then names := x :: !names
+    | Unop (_, e1) -> find e1
+    | Binop (_, e1, e2) -> find e1; find e2
+    | _ -> () in
+  find e;
+  List.fold_left (fun acc v ->
+    if List.mem_assoc v acc then acc else (v, load_named st v) :: acc) [] !names
+
+let rec build_expr (st : builder_state) (e : expr) : reg =
   match e with
-  | IntLit _ | Unop _ ->
-    let vars = ref [] in
-    let rec find_vars = function
-      | Var x -> if not (List.mem x !vars) then vars := x :: !vars
-      | Unop (_, e1) -> find_vars e1 | Binop (_, e1, e2) -> find_vars e1; find_vars e2
-      | _ -> () in
-    find_vars e;
-    let env' = List.fold_left (fun acc v ->
-      if List.mem_assoc v acc then acc else
-      let slot = try get_stack_slot st v with Failure _ -> failwith ("undeclared: " ^ v) in
+  | IntLit _ -> emit_pure st [] e
+  | Var x -> load_named st x
+  | Unop (op, e1) ->
+    if is_pure e then
+      let env = preload_vars st e in emit_pure st env e
+    else begin
+      let r1 = build_expr st e1 in
       let r = Util.fresh_reg () in
-      emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
-      (v, r) :: acc) env !vars in
-    emit_pure st env' e
-  | Var x ->
-    (match List.assoc_opt x env with
-     | Some r -> r
-     | None ->
-       (* Try local stack variable *)
-       (try
-         let slot = get_stack_slot st x in
-         let r = Util.fresh_reg () in
-         emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
-         r
-       with Failure _ ->
-         (* Try global variable *)
-         if List.mem_assoc x st.globals then
-           let r = Util.fresh_reg () in
-           emit_tac st (TLa (r, x));  (* load address *)
-           emit_tac st (TLoad (r, r, 0));  (* load value *)
-           r
-         else
-           failwith ("undeclared: " ^ x)))
+      emit_tac st (TUnop (r, op, r1)); r
+    end
   | Binop (And, e1, e2) ->
-    let r1 = build_expr st env e1 in
+    let r1 = build_expr st e1 in
     let r = Util.fresh_reg () in
-    let right_lbl = fresh_label st in
-    let false_lbl = fresh_label st in
-    let merge_lbl = fresh_label st in
-    emit_tac st (TCopy (r, r1));
-    finish_block st (TBranch (r1, right_lbl, false_lbl));
-    (* false_lbl *)
-    start_new_block st false_lbl;
+    let l_e2 = fresh_label st in
+    let l_false = fresh_label st in
+    let l_merge = fresh_label st in
+    finish_block st (TBranch (r1, l_e2, l_false));
+    (* evaluate e2 *)
+    start_new_block st l_e2;
+    let r2 = build_expr st e2 in
+    let z = Util.fresh_reg () in
+    emit_tac st (TConst (z, 0));
+    emit_tac st (TBinop (r, Ne, r2, z));
+    finish_block st (TJump l_merge);
+    (* short-circuit false *)
+    start_new_block st l_false;
     emit_tac st (TConst (r, 0));
-    finish_block st (TJump merge_lbl);
-    (* right_lbl: isolate builder state for e2 evaluation *)
-    start_new_block st right_lbl;
-    let saved_blocks = st.blocks in
-    let saved_label = st.cur_label in
-    let saved_body = st.cur_body in
-    st.blocks <- [];
-    let r2 = build_expr st env e2 in
-    let inner_blocks = List.rev st.blocks in
-    st.blocks <- saved_blocks;
-    st.cur_label <- saved_label;
-    st.cur_body <- saved_body;
-    let zero = Util.fresh_reg () in
-    emit_tac st (TConst (zero, 0));
-    emit_tac st (TBinop (r, Ne, r2, zero));
-    finish_block st (TJump merge_lbl);
-    st.blocks <- inner_blocks @ st.blocks;
-    start_new_block st merge_lbl; r
+    finish_block st (TJump l_merge);
+    start_new_block st l_merge; r
   | Binop (Or, e1, e2) ->
-    let r1 = build_expr st env e1 in
+    let r1 = build_expr st e1 in
     let r = Util.fresh_reg () in
-    let right_lbl = fresh_label st in
-    let true_lbl = fresh_label st in
-    let merge_lbl = fresh_label st in
-    emit_tac st (TCopy (r, r1));
-    finish_block st (TBranch (r1, true_lbl, right_lbl));
-    (* true_lbl *)
-    start_new_block st true_lbl;
+    let l_e2 = fresh_label st in
+    let l_true = fresh_label st in
+    let l_merge = fresh_label st in
+    finish_block st (TBranch (r1, l_true, l_e2));
+    (* evaluate e2 *)
+    start_new_block st l_e2;
+    let r2 = build_expr st e2 in
+    let z = Util.fresh_reg () in
+    emit_tac st (TConst (z, 0));
+    emit_tac st (TBinop (r, Ne, r2, z));
+    finish_block st (TJump l_merge);
+    (* short-circuit true *)
+    start_new_block st l_true;
     emit_tac st (TConst (r, 1));
-    finish_block st (TJump merge_lbl);
-    (* right_lbl: isolate builder state *)
-    start_new_block st right_lbl;
-    let saved_blocks = st.blocks in
-    let saved_label = st.cur_label in
-    let saved_body = st.cur_body in
-    st.blocks <- [];
-    let r2 = build_expr st env e2 in
-    let inner_blocks = List.rev st.blocks in
-    st.blocks <- saved_blocks;
-    st.cur_label <- saved_label;
-    st.cur_body <- saved_body;
-    let zero = Util.fresh_reg () in
-    emit_tac st (TConst (zero, 0));
-    emit_tac st (TBinop (r, Ne, r2, zero));
-    finish_block st (TJump merge_lbl);
-    st.blocks <- inner_blocks @ st.blocks;
-    start_new_block st merge_lbl; r
+    finish_block st (TJump l_merge);
+    start_new_block st l_merge; r
   | Binop (op, e1, e2) ->
-    (* If expression contains function calls, evaluate subexprs manually *)
     if not (is_pure e1) || not (is_pure e2) then begin
-      let r1 = build_expr st env e1 in
-      let r2 = build_expr st env e2 in
+      let r1 = build_expr st e1 in
+      let r2 = build_expr st e2 in
       let r = Util.fresh_reg () in
-      emit_tac st (TBinop (r, op, r1, r2));
-      r
+      emit_tac st (TBinop (r, op, r1, r2)); r
     end else begin
-      let vars = ref [] in
-      let rec find_vars = function
-        | IntLit _ -> ()
-        | Var x -> if not (List.mem x !vars) then vars := x :: !vars
-        | Unop (_, e1) -> find_vars e1
-        | Binop (_, e1, e2) -> find_vars e1; find_vars e2
-        | _ -> () in
-      find_vars e;
-      let env' = List.fold_left (fun acc v ->
-        if List.mem_assoc v acc then acc else
-        let slot = get_stack_slot st v in
-        let r = Util.fresh_reg () in
-        emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
-        (v, r) :: acc) env !vars in
-      emit_pure st env' e
+      let env = preload_vars st e in emit_pure st env e
     end
   | Call (f, args) ->
-    let arg_regs = List.map (build_expr st env) args in
+    let arg_regs = List.map (build_expr st) args in
     let r = Util.fresh_reg () in
     emit_tac st (TCall (r, f, arg_regs)); r
   | Assign _ -> failwith "assign in expr not supported"
@@ -272,68 +287,64 @@ let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) :
 (*  Statement builder                                                *)
 (* ================================================================= *)
 
-let rec build_stmt (st : builder_state) (env : (string * reg) list) (s : stmt) : unit =
+let rec build_stmt (st : builder_state) (s : stmt) : unit =
   match s with
   | Block ss ->
-    Symbol.push_scope st.symbols;
-    List.iter (build_stmt st env) ss;
-    Symbol.pop_scope st.symbols
+    push_scope st;
+    let saved = st.next_slot in
+    List.iter (build_stmt st) ss;
+    st.next_slot <- saved;      (* reclaim block-local slots on scope exit *)
+    pop_scope st
 
   | Empty -> ()
 
   | ExprStmt (Assign (x, e)) ->
-    let r = build_expr st env e in
-    (try
-       let slot = get_stack_slot st x in
-       emit_tac st (TStore (8(*fp*), -4 * (slot + 1), r))
-     with Failure _ ->
-       (* Global variable: la tmp, x; sw r, 0(tmp) *)
-       let tmp = Util.fresh_reg () in
-       emit_tac st (TLa (tmp, x));
-       emit_tac st (TStore (tmp, 0, r)))
+    let r = build_expr st e in
+    store_named st x r
+
+  | ExprStmt (Call (f, args)) ->
+    let arg_regs = List.map (build_expr st) args in
+    emit_tac st (TCallVoid (f, arg_regs))
 
   | ExprStmt e ->
-    let _ = build_expr st env e in ()
+    let _ = build_expr st e in ()
 
   | VarDecl (x, e) ->
-    let r = build_expr st env e in
-    let _slot = alloc_stack_slot st x in
-    emit_tac st (TStore (8 (*fp/s0*), -4 * (_slot + 1), r))
+    let r = build_expr st e in
+    let slot = alloc_stack_slot st x in
+    emit_tac st (TStore (8, slot_off slot, r))
 
   | ConstDecl (x, e) ->
-    let _v = Semant.eval_const st.symbols e in
-    let _slot = alloc_stack_slot st x in ()
+    let v = eval_const_b st e in
+    bind st x (ConstB v)
 
   | If (cond, then_s, else_s) ->
-    let rc = build_expr st env cond in
+    let rc = build_expr st cond in
     let then_lbl = fresh_label st in
     let else_lbl = fresh_label st in
     let end_lbl = fresh_label st in
     finish_block st (TBranch (rc, then_lbl, else_lbl));
     start_new_block st then_lbl;
-    build_stmt st env then_s;
-    finish_block st (TJump end_lbl);
+    build_stmt st then_s;
+    if st.block_open then finish_block st (TJump end_lbl);
     start_new_block st else_lbl;
-    Option.iter (build_stmt st env) else_s;
-    finish_block st (TJump end_lbl);
+    Option.iter (build_stmt st) else_s;
+    if st.block_open then finish_block st (TJump end_lbl);
     start_new_block st end_lbl
 
   | While (cond, body) ->
     let cond_lbl = fresh_label st in
     let body_lbl = fresh_label st in
     let end_lbl = fresh_label st in
-    let continue_lbl = fresh_label st in
     finish_block st (TJump cond_lbl);
     start_new_block st cond_lbl;
-    let rc = build_expr st env cond in
+    let rc = build_expr st cond in
     finish_block st (TBranch (rc, body_lbl, end_lbl));
     start_new_block st body_lbl;
-    st.loop_stack <- {break_lbl=end_lbl; continue_lbl} :: st.loop_stack;
-    build_stmt st env body;
+    st.loop_stack <- {break_lbl=end_lbl; continue_lbl=cond_lbl} :: st.loop_stack;
+    build_stmt st body;
     st.loop_stack <- List.tl st.loop_stack;
-    finish_block st (TJump continue_lbl);
-    start_new_block st continue_lbl;
-    finish_block st (TJump cond_lbl);
+    if st.block_open then finish_block st (TJump cond_lbl);
     start_new_block st end_lbl
 
   | Break ->
@@ -347,7 +358,7 @@ let rec build_stmt (st : builder_state) (env : (string * reg) list) (s : stmt) :
      | [] -> failwith "continue outside loop")
 
   | Return e_opt ->
-    let r_opt = Option.map (build_expr st env) e_opt in
+    let r_opt = Option.map (build_expr st) e_opt in
     finish_block st (TReturn r_opt)
 
 (* ================================================================= *)
@@ -356,33 +367,25 @@ let rec build_stmt (st : builder_state) (env : (string * reg) list) (s : stmt) :
 
 let build_program (prog : Ast.program) : program_cfg =
   Util.reset_reg (); Util.reset_label ();
+  let global_scope = Hashtbl.create 32 in
   let st = {
-    cur_label = "entry"; cur_body = []; blocks = []; functions = [];
-    loop_stack = [];
-    symbols = Symbol.create ();
-    stack_slots = Hashtbl.create 16; next_slot = 0; var_env = [];
-    globals = [];
+    cur_label = "entry"; cur_body = []; blocks = []; block_open = false;
+    functions = []; loop_stack = [];
+    scopes = [global_scope];
+    next_slot = 0; max_slots = 0;
   } in
   let globals = ref [] in
 
-  (* Pre-collect global variable names and register in symbol table *)
+  (* Pre-register globals in source order so const chains resolve. *)
   List.iter (function
-    | GVarDecl (x, _) ->
-      if not (List.mem_assoc x !globals) then globals := (x, 0) :: !globals;
-      if not (List.mem_assoc x st.globals) then st.globals <- (x, 0) :: st.globals;
-      Symbol.add st.symbols x (Var Int)
-    | GConstDecl (x, _) ->
-      if not (List.mem_assoc x !globals) then globals := (x, 0) :: !globals;
-      if not (List.mem_assoc x st.globals) then st.globals <- (x, 0) :: st.globals;
-      Symbol.add st.symbols x (ConstVal 0)
-    | _ -> ()
-  ) prog;
-
-  (* Register function signatures *)
-  List.iter (function
-    | GFuncDef fd ->
-      Symbol.add st.symbols fd.fname (Func (fd.fty, fd.params))
-    | _ -> ()
+    | GVarDecl (x, e) ->
+      let v = (try eval_const_b st e with _ -> 0) in
+      Hashtbl.replace global_scope x (GlobalB x);
+      globals := (x, v) :: !globals
+    | GConstDecl (x, e) ->
+      let v = eval_const_b st e in
+      Hashtbl.replace global_scope x (ConstB v)
+    | GFuncDef _ -> ()
   ) prog;
 
   (* Build each function *)
@@ -390,35 +393,31 @@ let build_program (prog : Ast.program) : program_cfg =
     | GFuncDef fd ->
       st.cur_body <- []; st.blocks <- [];
       st.cur_label <- fd.fname ^ "_entry";
-      st.stack_slots <- Hashtbl.create 16; st.next_slot <- 0;
-      Symbol.push_scope st.symbols;
-      let env = ref [] in
-      List.iteri (fun i p ->
-        let _slot = alloc_stack_slot st p.pname in
-        env := (p.pname, i) :: !env  (* params come from a0-a7, use param index *)
-      ) fd.params;
-      List.iter (build_stmt st !env) fd.body;
-      (* Finish last block if it has content (void functions/no return) *)
-      if st.cur_body <> [] then
-        finish_block st (TReturn None);
-      Symbol.pop_scope st.symbols;
+      st.block_open <- true;
+      st.next_slot <- 0; st.max_slots <- 0;
+      st.loop_stack <- [];
+      push_scope st;
+      (* params occupy the first slots, in order; codegen saves a0..a7 there *)
+      List.iter (fun p -> let _ = alloc_stack_slot st p.pname in ()) fd.params;
+      List.iter (build_stmt st) fd.body;
+      (* close any open trailing block (void fallthrough / unreachable merge) *)
+      if st.block_open then finish_block st (TReturn None);
+      pop_scope st;
       st.functions <- {name=fd.fname; ret_ty=fd.fty;
                        entry=fd.fname ^ "_entry";
-                       blocks=List.rev st.blocks} :: st.functions
-    | GVarDecl (x, e) ->
-      (try let v = Semant.eval_const st.symbols e in globals := (x,v) :: !globals
-       with Failure _ -> ())
-    | GConstDecl (x, e) ->
-      let v = Semant.eval_const st.symbols e in
-      globals := (x, v) :: !globals
+                       blocks=List.rev st.blocks;
+                       num_slots=st.max_slots;
+                       num_params=List.length fd.params} :: st.functions
+    | GVarDecl _ | GConstDecl _ -> ()
   ) prog;
 
-  st.globals <- List.rev !globals;
   { functions = List.rev st.functions; globals = List.rev !globals }
 
 (* ================================================================= *)
-(*  Optimizations (adapted from SimPL version)                       *)
+(*  Optimizations                                                    *)
 (* ================================================================= *)
+
+let norm l = List.sort_uniq compare l
 
 let term_live_out live_in_map term = match term with
   | TReturn (Some r) -> [r]
@@ -426,7 +425,7 @@ let term_live_out live_in_map term = match term with
   | TBranch (r, l1, l2) ->
     let l1in = try Hashtbl.find live_in_map l1 with _ -> [] in
     let l2in = try Hashtbl.find live_in_map l2 with _ -> [] in
-    r :: (l1in @ l2in)
+    norm (r :: (l1in @ l2in))
   | TJump lbl -> (try Hashtbl.find live_in_map lbl with _ -> [])
 
 let dce_block blk live_out =
@@ -449,7 +448,7 @@ let dce_block blk live_out =
     | TLa(r,_) ->
       if List.mem r !live then (kept:=instr::!kept; live:=List.filter((<>)r)!live)
   ) (List.rev blk.body);
-  ({ blk with body = !kept }, !live)
+  ({ blk with body = !kept }, norm !live)
 
 let compute_live_in blk live_out = snd (dce_block blk live_out)
 
@@ -491,10 +490,9 @@ let const_prop_block blk =
          let v = match op with Neg-> -a | Not-> if a=0 then 1 else 0 | Pos->a in
          Hashtbl.replace consts r (Some v); TConst(r,v)
        | _ -> Hashtbl.replace consts r None; instr)
-    | TLoad _|TCall _|TCallVoid _|TLa _ ->
-      (match instr with TLoad(r,_,_) -> Hashtbl.replace consts r None
-       | TCall(r,_,_) -> Hashtbl.replace consts r None
-       | TLa(r,_) -> Hashtbl.replace consts r None | _ -> ()); instr
+    | TLoad(r,_,_) -> Hashtbl.replace consts r None; instr
+    | TCall(r,_,_) -> Hashtbl.replace consts r None; instr
+    | TLa(r,_) -> Hashtbl.replace consts r None; instr
     | _ -> instr) blk.body in
   let term = match blk.term with
     | TBranch(r,l1,l2) ->

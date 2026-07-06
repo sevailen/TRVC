@@ -395,7 +395,8 @@ let from_ssa (fn : ssa_func) : func_cfg =
     ) b.s_body in
     { label = b.s_label; body; term = b.s_term }
   ) fn.s_blocks in
-  { name = ""; ret_ty = Int; entry = fn.s_entry; blocks }
+  { name = ""; ret_ty = Int; entry = fn.s_entry; blocks;
+    num_slots = 0; num_params = 0 }
 
 (** Full SSA optimization pipeline *)
 let optimize_ssa (fn : func_cfg) : func_cfg =

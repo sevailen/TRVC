@@ -1,7 +1,10 @@
 
 (* Utility: counters and label generators *)
 
-let reg_counter = ref 12  (* skip reserved: 8=fp, 10=a0, 11=a1 *)
+(* Reserved virtual registers:
+   2 = sp, 8 = fp/s0, 10..17 = a0..a7.
+   General-purpose fresh vregs start at 18. *)
+let reg_counter = ref 18
 
 let fresh_reg () =
   let r = !reg_counter in
@@ -9,7 +12,7 @@ let fresh_reg () =
   r
 
 let reset_reg () =
-  reg_counter := 12
+  reg_counter := 18
 
 let get_reg_count () =
   !reg_counter

@@ -19,3 +19,10 @@ _build/
 *.swp
 *.swo
 *~
+
+# Local RISC-V test harness (binaries, generated)
+testkit/*.elf
+testkit/*.s
+testkit/o.*
+testkit/e.txt
+testkit/ae.txt

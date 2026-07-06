@@ -1,121 +1,154 @@
-(** RV32 assembly emission *)
+(** RV32 assembly emission: frame model, spills, calling-convention prologue *)
 
 open Ir
 open Printf
 
-let reg_of alloc r =
-  if r = 8 then "fp" else if r = 10 then "a0" else if r = 11 then "a1"
+(* ---- allocation queries ---- *)
+let reg_name alloc r =
+  if r = 2 then "sp" else if r = 8 then "fp"
+  else if r >= 10 && r <= 17 then sprintf "a%d" (r - 10)
   else preg_str (Hashtbl.find alloc.mapping r)
 
-let is_spilled alloc r =
-  r <> 8 && r <> 10 && r <> 11 && not (Hashtbl.mem alloc.mapping r)
+let spilled alloc r = r >= 18 && Hashtbl.mem alloc.spill r
 
-let spill_slot r = 8 + (r - 12) * 4
+(* byte offsets from fp *)
+let local_off k = -(12 + 4 * k)
+let spill_off num_slots j = -(12 + 4 * num_slots + 4 * j)
+let callee_off num_slots spill_count i =
+  -(12 + 4 * num_slots + 4 * spill_count + 4 * i)
 
-let emit_prologue name frame is_main =
-  let g = if is_main then ".globl main\n" else "" in
-  sprintf "%s%s:\n\taddi sp,sp,-%d\n\tsw ra,%d(sp)\n\tsw fp,%d(sp)\n\tmv fp,sp\n"
-    g name frame (frame-4) (frame-8)
+let in_range off = off >= -2048 && off <= 2047
 
-let emit_epilogue frame =
-  sprintf "\tmv sp,fp\n\tlw ra,%d(sp)\n\tlw fp,%d(sp)\n\taddi sp,sp,%d\n\tret\n"
-    (frame-4) (frame-8) frame
+(* Load from fp+off into [dst], using [ascr] as address scratch for large offsets. *)
+let ld_fp buf dst off ascr =
+  if in_range off then bprintf buf "\tlw %s,%d(fp)\n" dst off
+  else bprintf buf "\tli %s,%d\n\tadd %s,fp,%s\n\tlw %s,0(%s)\n" ascr off ascr ascr dst ascr
 
-let emit_block alloc blk =
-  let buf = Buffer.create 256 in
-  let scratch_toggle = ref 0 in
-  let next_scratch () =
-    let s = if !scratch_toggle = 0 then "t5" else "t6" in
-    scratch_toggle := 1 - !scratch_toggle; s
+let st_fp buf src off ascr =
+  if in_range off then bprintf buf "\tsw %s,%d(fp)\n" src off
+  else bprintf buf "\tli %s,%d\n\tadd %s,fp,%s\n\tsw %s,0(%s)\n" ascr off ascr ascr src ascr
+
+let emit_func buf fn alloc =
+  let num_slots = fn.num_slots in
+  let sc = alloc.spill_count in
+  let callee = alloc.used_callee in
+  let ncallee = List.length callee in
+  let raw = 8 + 4*num_slots + 4*sc + 4*ncallee in
+  let frame = ((raw + 15) / 16) * 16 in
+
+  (* ---- prologue ---- *)
+  if fn.is_main then bprintf buf ".globl main\n";
+  bprintf buf "%s:\n" fn.name;
+  bprintf buf "\tli t6,%d\n\tsub sp,sp,t6\n\tadd t6,sp,t6\n" frame;
+  bprintf buf "\tsw ra,-4(t6)\n\tsw fp,-8(t6)\n\tmv fp,t6\n";
+  (* save callee-saved actually used *)
+  List.iteri (fun i c ->
+    st_fp buf (preg_str c) (callee_off num_slots sc i) "t5") callee;
+  (* save incoming params into their slots *)
+  for i = 0 to fn.num_params - 1 do
+    if i < 8 then
+      st_fp buf (sprintf "a%d" i) (local_off i) "t5"
+    else begin
+      (* incoming stack arg at fp + (i-8)*4 *)
+      let inoff = (i - 8) * 4 in
+      if in_range inoff then bprintf buf "\tlw t5,%d(fp)\n" inoff
+      else bprintf buf "\tli t5,%d\n\tadd t5,fp,t5\n\tlw t5,0(t5)\n" inoff;
+      st_fp buf "t5" (local_off i) "t4"
+    end
+  done;
+
+  (* ---- body ---- *)
+  (* materialize a source operand into a concrete reg name.
+     [vscr] = value scratch for spilled operands; uses t6 as address scratch. *)
+  let mat_src r vscr =
+    if spilled alloc r then begin
+      ld_fp buf vscr (spill_off num_slots (Hashtbl.find alloc.spill r)) "t6"; vscr
+    end else reg_name alloc r
   in
-  let load r =
-    let s = next_scratch () in
-    sprintf "\tlw %s,-%d(fp)\n" s (spill_slot r), s
+  (* write a computed value [valreg] to dest r (store if spilled). [ascr]=addr scratch *)
+  let put_dst r valreg ascr =
+    if spilled alloc r then
+      st_fp buf valreg (spill_off num_slots (Hashtbl.find alloc.spill r)) ascr
   in
-  let store r src =
-    sprintf "\tsw %s,-%d(fp)\n" src (spill_slot r)
-  in
+  let dst_reg r = if spilled alloc r then "t6" else reg_name alloc r in
 
-  List.iter (fun i -> match i with
-    | Label l -> bprintf buf "%s:\n" l
-    | Li (rd, n) ->
-      if is_spilled alloc rd
-      then bprintf buf "\tli t4,%d\n%s" n (store rd "t4")
-      else bprintf buf "\tli %s,%d\n" (reg_of alloc rd) n
-    | Mv (rd, rs) ->
-      if is_spilled alloc rd
-      then (if is_spilled alloc rs
-            then let _, ns = load rs in bprintf buf "%s" (store rd ns)
-            else bprintf buf "%s" (store rd (reg_of alloc rs)))
-      else (if is_spilled alloc rs
-            then let _, ns = load rs in bprintf buf "\tmv %s,%s\n" (reg_of alloc rd) ns
-            else bprintf buf "\tmv %s,%s\n" (reg_of alloc rd) (reg_of alloc rs))
-    | Add (rd, r1, r2) | Sub (rd, r1, r2) | Mul (rd, r1, r2)
-    | Div (rd, r1, r2) | Rem (rd, r1, r2)
-    | Slt (rd, r1, r2) | And (rd, r1, r2) | Or (rd, r1, r2) ->
-      let op = match i with Add _->"add" | Sub _->"sub" | Mul _->"mul"
-        | Div _->"div" | Rem _->"rem" | Slt _->"slt"
-        | And _->"and" | Or _->"or" | _->"???" in
-      scratch_toggle := 0;
-      let p1, n1 = if is_spilled alloc r1 then load r1 else ("", reg_of alloc r1) in
-      let p2, n2 = if is_spilled alloc r2 then load r2 else ("", reg_of alloc r2) in
-      bprintf buf "%s%s" p1 p2;
-      let d = if is_spilled alloc rd then next_scratch () else reg_of alloc rd in
-      bprintf buf "\t%s %s,%s,%s\n" op d n1 n2;
-      if is_spilled alloc rd then bprintf buf "%s" (store rd d)
-    | Xori (rd, rs, imm) ->
-      scratch_toggle := 0;
-      let p, n = if is_spilled alloc rs then load rs else ("", reg_of alloc rs) in
-      bprintf buf "%s" p;
-      let d = if is_spilled alloc rd then next_scratch () else reg_of alloc rd in
-      bprintf buf "\txori %s,%s,%d\n" d n imm;
-      if is_spilled alloc rd then bprintf buf "%s" (store rd d)
-    | Lw (rd, rb, off) ->
-      scratch_toggle := 0;
-      let p, n = if is_spilled alloc rb then load rb else ("", reg_of alloc rb) in
-      bprintf buf "%s" p;
-      let d = if is_spilled alloc rd then next_scratch () else reg_of alloc rd in
-      bprintf buf "\tlw %s,%d(%s)\n" d off n;
-      if is_spilled alloc rd then bprintf buf "%s" (store rd d)
-    | Sw (rb, off, rs) ->
-      scratch_toggle := 0;
-      let pb, nb = if is_spilled alloc rb then load rb else ("", reg_of alloc rb) in
-      let ps, ns = if is_spilled alloc rs then load rs else ("", reg_of alloc rs) in
-      bprintf buf "%s%s\tsw %s,%d(%s)\n" pb ps ns off nb
-    | La (rd, lbl) ->
-      let d = if is_spilled alloc rd then "t4" else reg_of alloc rd in
-      bprintf buf "\tla %s,%s\n" d lbl;
-      if is_spilled alloc rd then bprintf buf "%s" (store rd "t4")
-    | Jalr rs ->
-      scratch_toggle := 0;
-      let p, n = if is_spilled alloc rs then load rs else ("", reg_of alloc rs) in
-      bprintf buf "%s\tjalr ra,%s\n" p n
-    | Jal lbl -> bprintf buf "\tcall %s\n" lbl
-    | Beqz (rs, lbl) ->
-      scratch_toggle := 0;
-      let p, n = if is_spilled alloc rs then load rs else ("", reg_of alloc rs) in
-      bprintf buf "%s\tbeqz %s,%s\n" p n lbl
-    | Bnez (rs, lbl) ->
-      scratch_toggle := 0;
-      let p, n = if is_spilled alloc rs then load rs else ("", reg_of alloc rs) in
-      bprintf buf "%s\tbnez %s,%s\n" p n lbl
-    | J lbl -> bprintf buf "\tj %s\n" lbl
-    | Ret -> bprintf buf "\tret\n"
-  ) blk.instrs;
-  Buffer.contents buf
+  List.iter (fun blk ->
+    List.iter (fun i -> match i with
+      | Label l -> bprintf buf "%s:\n" l
+      | Li (rd, n) ->
+        bprintf buf "\tli %s,%d\n" (dst_reg rd) n; put_dst rd (dst_reg rd) "t5"
+      | Mv (rd, rs) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        if d <> s then bprintf buf "\tmv %s,%s\n" d s;
+        put_dst rd d "t5"
+      | Add(rd,r1,r2) | Sub(rd,r1,r2) | Mul(rd,r1,r2) | Div(rd,r1,r2)
+      | Rem(rd,r1,r2) | Slt(rd,r1,r2) | And(rd,r1,r2) | Or(rd,r1,r2) ->
+        let op = match i with Add _->"add"|Sub _->"sub"|Mul _->"mul"|Div _->"div"
+          |Rem _->"rem"|Slt _->"slt"|And _->"and"|Or _->"or"|_->"?" in
+        let a1 = mat_src r1 "t4" in
+        let a2 = mat_src r2 "t5" in
+        let d = dst_reg rd in
+        bprintf buf "\t%s %s,%s,%s\n" op d a1 a2;
+        put_dst rd d "t4"
+      | Addi (rd, rs, n) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        bprintf buf "\taddi %s,%s,%d\n" d s n;
+        put_dst rd d "t5"
+      | Xori (rd, rs, n) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        bprintf buf "\txori %s,%s,%d\n" d s n;
+        put_dst rd d "t5"
+      | Seqz (rd, rs) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        bprintf buf "\tseqz %s,%s\n" d s;
+        put_dst rd d "t5"
+      | Snez (rd, rs) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        bprintf buf "\tsnez %s,%s\n" d s;
+        put_dst rd d "t5"
+      | La (rd, lbl) ->
+        let d = dst_reg rd in
+        bprintf buf "\tla %s,%s\n" d lbl;
+        put_dst rd d "t5"
+      | Lw (rd, rb, off) ->
+        let b = mat_src rb "t4" in
+        let d = dst_reg rd in
+        if in_range off then bprintf buf "\tlw %s,%d(%s)\n" d off b
+        else bprintf buf "\tli t5,%d\n\tadd t5,%s,t5\n\tlw %s,0(t5)\n" off b d;
+        put_dst rd d "t4"
+      | Sw (rb, off, rs) ->
+        let b = mat_src rb "t4" in
+        let s = mat_src rs "t5" in
+        if in_range off then bprintf buf "\tsw %s,%d(%s)\n" s off b
+        else bprintf buf "\tli t6,%d\n\tadd t6,%s,t6\n\tsw %s,0(t6)\n" off b s
+      | Beqz (rs, lbl) ->
+        let s = mat_src rs "t4" in bprintf buf "\tbeqz %s,%s\n" s lbl
+      | Bnez (rs, lbl) ->
+        let s = mat_src rs "t4" in bprintf buf "\tbnez %s,%s\n" s lbl
+      | Jalr rs -> let s = mat_src rs "t4" in bprintf buf "\tjalr ra,%s\n" s
+      | Jal lbl -> bprintf buf "\tcall %s\n" lbl
+      | J lbl -> bprintf buf "\tj %s\n" lbl
+      | Ret -> bprintf buf "\tret\n"
+    ) blk.instrs
+  ) fn.blocks;
+
+  (* ---- epilogue ---- *)
+  bprintf buf "%s:\n" (Ir.epi_label fn.name);
+  List.iteri (fun i c ->
+    ld_fp buf (preg_str c) (callee_off num_slots sc i) "t5") callee;
+  bprintf buf "\tlw ra,-4(fp)\n\tlw t6,-8(fp)\n\tmv sp,fp\n\tmv fp,t6\n\tret\n"
 
 let emit (prog : program) =
-  let buf = Buffer.create 2048 in
+  let buf = Buffer.create 4096 in
   Buffer.add_string buf ".text\n";
   List.iter (fun fn ->
     let alloc = allocate fn in
-    let spill_count = List.length alloc.spills in
-    let frame = 8 + spill_count * 4 in
-    Buffer.add_string buf (emit_prologue fn.name frame fn.is_main);
-    List.iter (fun blk ->
-      Buffer.add_string buf (emit_block alloc blk)
-    ) fn.blocks;
-    Buffer.add_string buf (emit_epilogue frame);
+    emit_func buf fn alloc;
     Buffer.add_string buf "\n"
   ) prog.functions;
   if prog.globals <> [] then begin
