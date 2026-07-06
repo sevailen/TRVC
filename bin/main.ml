@@ -10,9 +10,7 @@ let () =
     let cfg = Cfg.build_program ast in
     let opt_cfg =
       if Array.length Sys.argv > 1 && Sys.argv.(1) = "-opt" then
-        let local = Cfg.optimize_program cfg in
-        { local with
-          Cfg.functions = List.map Ssa.optimize_ssa local.Cfg.functions }
+        Cfg.optimize_program cfg
       else cfg in
     let ir = Ir.lower_program opt_cfg in
     let asm = Codegen.emit ir in

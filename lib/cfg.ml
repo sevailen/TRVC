@@ -365,6 +365,19 @@ let build_program (prog : Ast.program) : program_cfg =
   } in
   let globals = ref [] in
 
+  (* Pre-collect global variable names and register in symbol table *)
+  List.iter (function
+    | GVarDecl (x, _) ->
+      if not (List.mem_assoc x !globals) then globals := (x, 0) :: !globals;
+      if not (List.mem_assoc x st.globals) then st.globals <- (x, 0) :: st.globals;
+      Symbol.add st.symbols x (Var Int)
+    | GConstDecl (x, _) ->
+      if not (List.mem_assoc x !globals) then globals := (x, 0) :: !globals;
+      if not (List.mem_assoc x st.globals) then st.globals <- (x, 0) :: st.globals;
+      Symbol.add st.symbols x (ConstVal 0)
+    | _ -> ()
+  ) prog;
+
   (* Register function signatures *)
   List.iter (function
     | GFuncDef fd ->
@@ -385,6 +398,9 @@ let build_program (prog : Ast.program) : program_cfg =
         env := (p.pname, i) :: !env  (* params come from a0-a7, use param index *)
       ) fd.params;
       List.iter (build_stmt st !env) fd.body;
+      (* Finish last block if it has content (void functions/no return) *)
+      if st.cur_body <> [] then
+        finish_block st (TReturn None);
       Symbol.pop_scope st.symbols;
       st.functions <- {name=fd.fname; ret_ty=fd.fty;
                        entry=fd.fname ^ "_entry";
