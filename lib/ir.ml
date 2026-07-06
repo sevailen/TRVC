@@ -52,6 +52,7 @@ let lower_tac t = match t with
     [Li(t,0); Slt(t,t,r1); Xori(r,t,1)]
   | TUnop(r,Pos,r1) -> [Mv(r,r1)]
   | TCopy(rd,rs) -> [Mv(rd,rs)]
+  | TLa(rd,lbl) -> [La(rd,lbl)]
   | TLoad(rd,rb,off) -> [Lw(rd,rb,off)]
   | TStore(rb,off,rs) -> [Sw(rb,off,rs)]
   | TCall(r,f,args) ->

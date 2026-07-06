@@ -237,6 +237,7 @@ let to_ssa (fn : func_cfg) : ssa_func =
         | TCopy(r,rs) -> SCopy(make_def r, rename_use rs)
         | TLoad(r,rb,off) -> SLoad(make_def r, rename_use rb, off)
         | TStore(rb,off,rs) -> SStore(rename_use rb, off, rename_use rs)
+        | TLa(r,_) -> SConst(make_def r, 0)  (* TLa not SSA'd — just placeholder *)
         | TCall(r,f,args) -> SCall(make_def r, f, List.map rename_use args)
         | TCallVoid(f,args) -> SCallVoid(f, List.map rename_use args)
       ) blk.body in
@@ -389,8 +390,6 @@ let from_ssa (fn : ssa_func) : func_cfg =
       | SCall(r,f,args) -> [TCall(fst r, f, List.map fst args)]
       | SCallVoid(f,args) -> [TCallVoid(f, List.map fst args)]
       | SPhi(dst, ops) ->
-        (* φ node: simplified — emit as copies (correct for blocks
-           with only one predecessor; lossy for merges) *)
         if ops <> [] then [TCopy(fst dst, fst (List.hd ops))]
         else []
     ) b.s_body in

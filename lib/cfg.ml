@@ -13,6 +13,7 @@ type tac =
   | TCopy of reg * reg
   | TLoad of reg * reg * int
   | TStore of reg * int * reg
+  | TLa of reg * string
   | TCall of reg * string * reg list
   | TCallVoid of string * reg list
 
@@ -96,6 +97,7 @@ type builder_state = {
   mutable stack_slots : (string, int) Hashtbl.t;
   mutable next_slot : int;
   mutable var_env : (string * reg) list;
+  mutable globals : (string * int) list;
 }
 
 let fresh_label (_st : builder_state) = Util.fresh_label "L"
@@ -162,10 +164,21 @@ let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) :
     (match List.assoc_opt x env with
      | Some r -> r
      | None ->
-       let slot = try get_stack_slot st x with Failure _ -> failwith ("undeclared: " ^ x) in
-       let r = Util.fresh_reg () in
-       emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
-       r)
+       (* Try local stack variable *)
+       (try
+         let slot = get_stack_slot st x in
+         let r = Util.fresh_reg () in
+         emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
+         r
+       with Failure _ ->
+         (* Try global variable *)
+         if List.mem_assoc x st.globals then
+           let r = Util.fresh_reg () in
+           emit_tac st (TLa (r, x));  (* load address *)
+           emit_tac st (TLoad (r, r, 0));  (* load value *)
+           r
+         else
+           failwith ("undeclared: " ^ x)))
   | Binop (And, e1, e2) ->
     let r1 = build_expr st env e1 in
     let r = Util.fresh_reg () in
@@ -174,18 +187,26 @@ let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) :
     let merge_lbl = fresh_label st in
     emit_tac st (TCopy (r, r1));
     finish_block st (TBranch (r1, right_lbl, false_lbl));
-    (* false_lbl: r = 0 *)
+    (* false_lbl *)
     start_new_block st false_lbl;
     emit_tac st (TConst (r, 0));
     finish_block st (TJump merge_lbl);
-    (* right_lbl: evaluate e2 *)
+    (* right_lbl: isolate builder state for e2 evaluation *)
     start_new_block st right_lbl;
+    let saved_blocks = st.blocks in
+    let saved_label = st.cur_label in
+    let saved_body = st.cur_body in
+    st.blocks <- [];
     let r2 = build_expr st env e2 in
+    let inner_blocks = List.rev st.blocks in
+    st.blocks <- saved_blocks;
+    st.cur_label <- saved_label;
+    st.cur_body <- saved_body;
     let zero = Util.fresh_reg () in
     emit_tac st (TConst (zero, 0));
     emit_tac st (TBinop (r, Ne, r2, zero));
     finish_block st (TJump merge_lbl);
-    (* merge *)
+    st.blocks <- inner_blocks @ st.blocks;
     start_new_block st merge_lbl; r
   | Binop (Or, e1, e2) ->
     let r1 = build_expr st env e1 in
@@ -195,18 +216,26 @@ let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) :
     let merge_lbl = fresh_label st in
     emit_tac st (TCopy (r, r1));
     finish_block st (TBranch (r1, true_lbl, right_lbl));
-    (* true_lbl: r = 1 *)
+    (* true_lbl *)
     start_new_block st true_lbl;
     emit_tac st (TConst (r, 1));
     finish_block st (TJump merge_lbl);
-    (* right_lbl: evaluate e2 *)
+    (* right_lbl: isolate builder state *)
     start_new_block st right_lbl;
+    let saved_blocks = st.blocks in
+    let saved_label = st.cur_label in
+    let saved_body = st.cur_body in
+    st.blocks <- [];
     let r2 = build_expr st env e2 in
+    let inner_blocks = List.rev st.blocks in
+    st.blocks <- saved_blocks;
+    st.cur_label <- saved_label;
+    st.cur_body <- saved_body;
     let zero = Util.fresh_reg () in
     emit_tac st (TConst (zero, 0));
     emit_tac st (TBinop (r, Ne, r2, zero));
     finish_block st (TJump merge_lbl);
-    (* merge *)
+    st.blocks <- inner_blocks @ st.blocks;
     start_new_block st merge_lbl; r
   | Binop (op, e1, e2) ->
     (* If expression contains function calls, evaluate subexprs manually *)
@@ -254,8 +283,14 @@ let rec build_stmt (st : builder_state) (env : (string * reg) list) (s : stmt) :
 
   | ExprStmt (Assign (x, e)) ->
     let r = build_expr st env e in
-    let slot = get_stack_slot st x in
-    emit_tac st (TStore (8(*fp*), -4 * (slot + 1), r))
+    (try
+       let slot = get_stack_slot st x in
+       emit_tac st (TStore (8(*fp*), -4 * (slot + 1), r))
+     with Failure _ ->
+       (* Global variable: la tmp, x; sw r, 0(tmp) *)
+       let tmp = Util.fresh_reg () in
+       emit_tac st (TLa (tmp, x));
+       emit_tac st (TStore (tmp, 0, r)))
 
   | ExprStmt e ->
     let _ = build_expr st env e in ()
@@ -326,6 +361,7 @@ let build_program (prog : Ast.program) : program_cfg =
     loop_stack = [];
     symbols = Symbol.create ();
     stack_slots = Hashtbl.create 16; next_slot = 0; var_env = [];
+    globals = [];
   } in
   let globals = ref [] in
 
@@ -361,6 +397,7 @@ let build_program (prog : Ast.program) : program_cfg =
       globals := (x, v) :: !globals
   ) prog;
 
+  st.globals <- List.rev !globals;
   { functions = List.rev st.functions; globals = List.rev !globals }
 
 (* ================================================================= *)
@@ -393,6 +430,8 @@ let dce_block blk live_out =
     | TCall(r,_,args) ->
       kept:=instr::!kept; live:=List.filter((<>)r)!live; List.iter add args
     | TCallVoid(_,args) -> kept:=instr::!kept; List.iter add args
+    | TLa(r,_) ->
+      if List.mem r !live then (kept:=instr::!kept; live:=List.filter((<>)r)!live)
   ) (List.rev blk.body);
   ({ blk with body = !kept }, !live)
 
@@ -436,9 +475,10 @@ let const_prop_block blk =
          let v = match op with Neg-> -a | Not-> if a=0 then 1 else 0 | Pos->a in
          Hashtbl.replace consts r (Some v); TConst(r,v)
        | _ -> Hashtbl.replace consts r None; instr)
-    | TLoad _|TCall _|TCallVoid _ ->
+    | TLoad _|TCall _|TCallVoid _|TLa _ ->
       (match instr with TLoad(r,_,_) -> Hashtbl.replace consts r None
-       | TCall(r,_,_) -> Hashtbl.replace consts r None | _ -> ()); instr
+       | TCall(r,_,_) -> Hashtbl.replace consts r None
+       | TLa(r,_) -> Hashtbl.replace consts r None | _ -> ()); instr
     | _ -> instr) blk.body in
   let term = match blk.term with
     | TBranch(r,l1,l2) ->
@@ -455,7 +495,7 @@ let copy_prop_block blk =
     | _ ->
       (match instr with
        | TConst(r,_)|TUnop(r,_,_)|TBinop(r,_,_,_)
-       | TLoad(r,_,_)|TCall(r,_,_) -> Hashtbl.remove copies r | _ -> ());
+       | TLoad(r,_,_)|TCall(r,_,_)|TLa(r,_) -> Hashtbl.remove copies r | _ -> ());
       match instr with
       | TBinop(r,op,r1,r2) -> TBinop(r,op,subst r1,subst r2)
       | TUnop(r,op,r1) -> TUnop(r,op,subst r1)
