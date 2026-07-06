@@ -10,6 +10,7 @@ type instr =
   | Mul of vreg * vreg * vreg | Div of vreg * vreg * vreg
   | Rem of vreg * vreg * vreg
   | Slt of vreg * vreg * vreg | Xori of vreg * vreg * int
+  | Slti of vreg * vreg * int
   | Seqz of vreg * vreg | Snez of vreg * vreg
   | And of vreg * vreg * vreg | Or of vreg * vreg * vreg
   | Lw of vreg * vreg * int | Sw of vreg * int * vreg
@@ -46,6 +47,11 @@ let rec lower_tac t = match t with
      | Ast.Ne -> [Sub(r,r1,r2); Snez(r,r)]
      | Ast.And -> [And(r,r1,r2)]
      | Ast.Or -> [Or(r,r1,r2)])
+  | TBinopImm(r,op,r1,n) ->
+    (match op with
+     | Ast.Add -> [Addi(r,r1,n)]
+     | Ast.Lt -> [Slti(r,r1,n)]
+     | _ -> failwith "unsupported immediate binop")
   | TUnop(r,Neg,r1) ->
     let zero = Util.fresh_reg() in
     [Li(zero,0); Sub(r,zero,r1)]
@@ -86,11 +92,23 @@ let lower_block epi (blk : Cfg.block) : ir_block =
 
 let epi_label name = ".Lepi_" ^ name
 
+(* Drop a block's trailing `J l` when l is the very next block (fall-through). *)
+let drop_fallthrough fn =
+  let arr = Array.of_list fn.blocks in
+  let n = Array.length arr in
+  let blocks = List.mapi (fun k b ->
+    let next = if k + 1 < n then Some arr.(k+1).label else None in
+    match List.rev b.instrs, next with
+    | J l :: rest, Some nl when l = nl -> { b with instrs = List.rev rest }
+    | _ -> b) fn.blocks in
+  { fn with blocks }
+
 let lower_func (fn : Cfg.func_cfg) (is_main : bool) : ir_func =
   let epi = epi_label fn.name in
   let blocks = List.map (lower_block epi) fn.blocks in
-  { name = fn.name; blocks;
-    num_slots = fn.num_slots; num_params = fn.num_params; is_main }
+  drop_fallthrough
+    { name = fn.name; blocks;
+      num_slots = fn.num_slots; num_params = fn.num_params; is_main }
 
 let lower_program (prog : Cfg.program_cfg) : program =
   { functions = List.map (fun f -> lower_func f (f.name = "main")) prog.functions;
@@ -121,34 +139,95 @@ type alloc_result = {
   used_callee : phys_reg list;            (* callee-saved regs actually used *)
 }
 
+module IS = Set.Make (Int)
+
+(* def/use of allocatable vregs (>=18) for one instruction *)
+let def_use = function
+  | Li(r,_) | La(r,_) -> ([r],[])
+  | Mv(r,s) -> ([r],[s])
+  | Add(r,x,y)|Sub(r,x,y)|Mul(r,x,y)|Div(r,x,y)|Rem(r,x,y)
+  | Slt(r,x,y)|And(r,x,y)|Or(r,x,y) -> ([r],[x;y])
+  | Addi(r,s,_)|Xori(r,s,_)|Slti(r,s,_)|Seqz(r,s)|Snez(r,s) -> ([r],[s])
+  | Lw(r,b,_) -> ([r],[b])
+  | Sw(b,_,s) -> ([],[b;s])
+  | Beqz(r,_)|Bnez(r,_)|Jalr r -> ([],[r])
+  | Jal _|J _|Label _|Ret -> ([],[])
+
 let allocate fn =
-  (* Global instruction numbering; record calls, first/last use per general vreg. *)
-  let idx = ref 0 in
+  let blocks = Array.of_list fn.blocks in
+  let nb = Array.length blocks in
+  (* label -> block index *)
+  let lbl2idx = Hashtbl.create 64 in
+  Array.iteri (fun i b -> Hashtbl.replace lbl2idx b.label i) blocks;
+  (* successors of each block, from J/Bnez/Beqz targets that name a real block *)
+  let succ = Array.map (fun b ->
+    List.fold_left (fun acc ins -> match ins with
+      | J l | Bnez(_,l) | Beqz(_,l) ->
+        (match Hashtbl.find_opt lbl2idx l with Some j -> j :: acc | None -> acc)
+      | _ -> acc) [] b.instrs) blocks in
+  (* def/use sets per block (only vregs >=18), computed backward *)
+  let flt l = IS.of_list (List.filter (fun r -> r >= 18) l) in
+  let bdef = Array.make nb IS.empty and buse = Array.make nb IS.empty in
+  Array.iteri (fun i b ->
+    let uu = ref IS.empty and dd = ref IS.empty in
+    List.iter (fun ins ->
+      let ds, us = def_use ins in
+      let ds = flt ds and us = flt us in
+      uu := IS.union us (IS.diff !uu ds);
+      dd := IS.union !dd ds
+    ) (List.rev b.instrs);
+    buse.(i) <- !uu; bdef.(i) <- !dd
+  ) blocks;
+  (* fixpoint: live_in/live_out per block *)
+  let live_in = Array.make nb IS.empty and live_out = Array.make nb IS.empty in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    for i = nb - 1 downto 0 do
+      let out = List.fold_left (fun acc s -> IS.union acc live_in.(s)) IS.empty succ.(i) in
+      let inn = IS.union buse.(i) (IS.diff out bdef.(i)) in
+      if not (IS.equal out live_out.(i)) then (live_out.(i) <- out; changed := true);
+      if not (IS.equal inn live_in.(i)) then (live_in.(i) <- inn; changed := true)
+    done
+  done;
+  (* per-instruction: global index, live-out, call indices; derive intervals *)
+  let first = Hashtbl.create 256 and last = Hashtbl.create 256 in
   let calls = ref [] in
-  let first = Hashtbl.create 64 and last = Hashtbl.create 64 in
-  let note r =
+  let crossers = Hashtbl.create 64 in
+  let gidx = ref 0 in
+  let bump r g =
     if r >= 18 then begin
-      if not (Hashtbl.mem first r) then Hashtbl.add first r !idx;
-      Hashtbl.replace last r !idx
+      (match Hashtbl.find_opt first r with
+       | Some f when f <= g -> () | _ -> Hashtbl.replace first r g);
+      (match Hashtbl.find_opt last r with
+       | Some l when l >= g -> () | _ -> Hashtbl.replace last r g)
     end in
-  List.iter (fun b -> List.iter (fun ins ->
-    (match ins with Jal _ -> calls := !idx :: !calls | _ -> ());
-    (match ins with
-     | Li(r,_) | La(r,_) | Jalr r | Beqz(r,_) | Bnez(r,_) -> note r
-     | Mv(r,s) -> note r; note s
-     | Addi(r,s,_) | Xori(r,s,_) | Seqz(r,s) | Snez(r,s) -> note r; note s
-     | Add(r,x,y)|Sub(r,x,y)|Mul(r,x,y)|Div(r,x,y)|Rem(r,x,y)
-     | Slt(r,x,y)|And(r,x,y)|Or(r,x,y) -> note r; note x; note y
-     | Lw(r,bse,_) -> note r; note bse
-     | Sw(bse,_,s) -> note bse; note s
-     | Jal _ | J _ | Label _ | Ret -> ());
-    incr idx) b.instrs) fn.blocks;
-  let call_idxs = List.rev !calls in
-  let crosses s e = List.exists (fun c -> s < c && c < e) call_idxs in
-  (* intervals sorted by start *)
+  Array.iteri (fun i b ->
+    let live = ref live_out.(i) in           (* live-after current instr *)
+    let n = List.length b.instrs in
+    let base = !gidx in
+    gidx := !gidx + n;
+    List.iteri (fun k ins ->
+      let g = base + (n - 1 - k) in           (* global index of this instr *)
+      let ds, us = def_use ins in
+      let ds = flt ds and us = flt us in
+      IS.iter (fun r -> bump r g) !live;      (* live across this point *)
+      IS.iter (fun r -> bump r g) ds;
+      IS.iter (fun r -> bump r g) us;
+      (match ins with
+       | Jal _ -> calls := g :: !calls;
+         IS.iter (fun r -> Hashtbl.replace crossers r ()) !live
+       | _ -> ());
+      live := IS.union us (IS.diff !live ds)
+    ) (List.rev b.instrs)
+  ) blocks;
+  ignore calls;
+  let crosses_v r = Hashtbl.mem crossers r in
   let intervals =
     Hashtbl.fold (fun r s acc -> (r, s, Hashtbl.find last r) :: acc) first []
     |> List.sort (fun (_,s1,_) (_,s2,_) -> compare s1 s2) in
+
+
   let mapping = Hashtbl.create 64 in
   let spill = Hashtbl.create 16 in
   let spill_ctr = ref 0 in
@@ -169,7 +248,7 @@ let allocate fn =
   let add_active e r phys = active := (e, r, phys) :: !active in
   List.iter (fun (r, s, e) ->
     expire s;
-    let need_callee = crosses s e in
+    let need_callee = crosses_v r in
     let chosen =
       if need_callee then
         (match !free_callee with

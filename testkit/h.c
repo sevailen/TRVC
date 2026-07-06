@@ -1,0 +1,1 @@
+int main(){int sum=0,i=0;while(i<3000){int j=0;while(j<3000){sum=sum+i*j-j;j=j+1;}i=i+1;}return sum%251;}

@@ -233,6 +233,7 @@ let to_ssa (fn : func_cfg) : ssa_func =
         match instr with
         | TConst(r,n) -> SConst(make_def r, n)
         | TBinop(r,op,r1,r2) -> SBinop(make_def r, op, rename_use r1, rename_use r2)
+        | TBinopImm(r,_,r1,_) -> SUnop(make_def r, Ast.Pos, rename_use r1)
         | TUnop(r,op,r1) -> SUnop(make_def r, op, rename_use r1)
         | TCopy(r,rs) -> SCopy(make_def r, rename_use rs)
         | TLoad(r,rb,off) -> SLoad(make_def r, rename_use rb, off)

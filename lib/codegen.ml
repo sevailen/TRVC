@@ -44,18 +44,7 @@ let emit_func buf fn alloc =
   (* save callee-saved actually used *)
   List.iteri (fun i c ->
     st_fp buf (preg_str c) (callee_off num_slots sc i) "t5") callee;
-  (* save incoming params into their slots *)
-  for i = 0 to fn.num_params - 1 do
-    if i < 8 then
-      st_fp buf (sprintf "a%d" i) (local_off i) "t5"
-    else begin
-      (* incoming stack arg at fp + (i-8)*4 *)
-      let inoff = (i - 8) * 4 in
-      if in_range inoff then bprintf buf "\tlw t5,%d(fp)\n" inoff
-      else bprintf buf "\tli t5,%d\n\tadd t5,fp,t5\n\tlw t5,0(t5)\n" inoff;
-      st_fp buf "t5" (local_off i) "t4"
-    end
-  done;
+  (* params are initialized in the entry block via TAC (mem2reg), not here. *)
 
   (* ---- body ---- *)
   (* materialize a source operand into a concrete reg name.
@@ -95,6 +84,11 @@ let emit_func buf fn alloc =
         let s = mat_src rs "t4" in
         let d = dst_reg rd in
         bprintf buf "\taddi %s,%s,%d\n" d s n;
+        put_dst rd d "t5"
+      | Slti (rd, rs, n) ->
+        let s = mat_src rs "t4" in
+        let d = dst_reg rd in
+        bprintf buf "\tslti %s,%s,%d\n" d s n;
         put_dst rd d "t5"
       | Xori (rd, rs, n) ->
         let s = mat_src rs "t4" in

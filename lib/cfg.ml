@@ -9,6 +9,7 @@ type label = string
 type tac =
   | TConst of reg * int
   | TBinop of reg * binop * reg * reg
+  | TBinopImm of reg * binop * reg * int   (* r := r1 op imm (Add/Lt only) *)
   | TUnop of reg * unop * reg
   | TCopy of reg * reg
   | TLoad of reg * reg * int
@@ -94,6 +95,7 @@ let process_segments segments =
 (* Variable binding kinds resolved by the CFG builder *)
 type binding =
   | Slot of int        (* local var / param: fp-relative stack slot index *)
+  | RegB of int        (* local var / param promoted to a dedicated vreg (mem2reg) *)
   | ConstB of int      (* compile-time constant value *)
   | GlobalB of string  (* global variable: addressed by symbol name *)
 
@@ -174,6 +176,7 @@ let rec eval_const_b (st : builder_state) (e : expr) : int =
 
 let load_named (st : builder_state) (name : string) : reg =
   match resolve st name with
+  | Some (RegB v) -> v
   | Some (Slot k) ->
     let r = Util.fresh_reg () in emit_tac st (TLoad (r, 8, slot_off k)); r
   | Some (ConstB n) ->
@@ -185,6 +188,7 @@ let load_named (st : builder_state) (name : string) : reg =
 
 let store_named (st : builder_state) (name : string) (r : reg) : unit =
   match resolve st name with
+  | Some (RegB v) -> emit_tac st (TCopy (v, r))
   | Some (Slot k) -> emit_tac st (TStore (8, slot_off k, r))
   | Some (GlobalB g) ->
     let tmp = Util.fresh_reg () in
@@ -311,8 +315,9 @@ let rec build_stmt (st : builder_state) (s : stmt) : unit =
 
   | VarDecl (x, e) ->
     let r = build_expr st e in
-    let slot = alloc_stack_slot st x in
-    emit_tac st (TStore (8, slot_off slot, r))
+    let v = Util.fresh_reg () in
+    emit_tac st (TCopy (v, r));
+    bind st x (RegB v)
 
   | ConstDecl (x, e) ->
     let v = eval_const_b st e in
@@ -397,8 +402,13 @@ let build_program (prog : Ast.program) : program_cfg =
       st.next_slot <- 0; st.max_slots <- 0;
       st.loop_stack <- [];
       push_scope st;
-      (* params occupy the first slots, in order; codegen saves a0..a7 there *)
-      List.iter (fun p -> let _ = alloc_stack_slot st p.pname in ()) fd.params;
+      (* mem2reg: each param gets a dedicated vreg, initialized at entry from
+         the ABI arg register (a0..a7 = vregs 10..17) or the caller's stack. *)
+      List.iteri (fun i p ->
+        let v = Util.fresh_reg () in
+        (if i < 8 then emit_tac st (TCopy (v, 10 + i))
+         else emit_tac st (TLoad (v, 8, (i - 8) * 4)));
+        bind st p.pname (RegB v)) fd.params;
       List.iter (build_stmt st) fd.body;
       (* close any open trailing block (void fallthrough / unreachable merge) *)
       if st.block_open then finish_block st (TReturn None);
@@ -406,7 +416,7 @@ let build_program (prog : Ast.program) : program_cfg =
       st.functions <- {name=fd.fname; ret_ty=fd.fty;
                        entry=fd.fname ^ "_entry";
                        blocks=List.rev st.blocks;
-                       num_slots=st.max_slots;
+                       num_slots=0;
                        num_params=List.length fd.params} :: st.functions
     | GVarDecl _ | GConstDecl _ -> ()
   ) prog;
@@ -437,6 +447,9 @@ let dce_block blk live_out =
     | TBinop(r,_,r1,r2) ->
       if List.mem r !live then
         (kept:=instr::!kept; live:=List.filter((<>)r)!live; add r1; add r2)
+    | TBinopImm(r,_,r1,_) ->
+      if List.mem r !live then
+        (kept:=instr::!kept; live:=List.filter((<>)r)!live; add r1)
     | TCopy(r,rs) ->
       if List.mem r !live then (kept:=instr::!kept; live:=List.filter((<>)r)!live; add rs)
     | TLoad(r,rb,_) ->
@@ -490,6 +503,11 @@ let const_prop_block blk =
          let v = match op with Neg-> -a | Not-> if a=0 then 1 else 0 | Pos->a in
          Hashtbl.replace consts r (Some v); TConst(r,v)
        | _ -> Hashtbl.replace consts r None; instr)
+    | TBinopImm(r,op,r1,n) ->
+      (match lookup r1 with
+       | Some a -> let v = Dag.eval_const_binop op a n in
+         Hashtbl.replace consts r (Some v); TConst(r,v)
+       | _ -> Hashtbl.replace consts r None; instr)
     | TLoad(r,_,_) -> Hashtbl.replace consts r None; instr
     | TCall(r,_,_) -> Hashtbl.replace consts r None; instr
     | TLa(r,_) -> Hashtbl.replace consts r None; instr
@@ -508,10 +526,11 @@ let copy_prop_block blk =
     | TCopy(r,rs) -> Hashtbl.replace copies r (subst rs); instr
     | _ ->
       (match instr with
-       | TConst(r,_)|TUnop(r,_,_)|TBinop(r,_,_,_)
+       | TConst(r,_)|TUnop(r,_,_)|TBinop(r,_,_,_)|TBinopImm(r,_,_,_)
        | TLoad(r,_,_)|TCall(r,_,_)|TLa(r,_) -> Hashtbl.remove copies r | _ -> ());
       match instr with
       | TBinop(r,op,r1,r2) -> TBinop(r,op,subst r1,subst r2)
+      | TBinopImm(r,op,r1,n) -> TBinopImm(r,op,subst r1,n)
       | TUnop(r,op,r1) -> TUnop(r,op,subst r1)
       | TStore(rb,off,rs) -> TStore(subst rb,off,subst rs)
       | TCall(r,f,args) -> TCall(r,f,List.map subst args)
@@ -523,14 +542,117 @@ let copy_prop_block blk =
     | _ -> blk.term in
   {blk with body; term}
 
-(** Local optimization: DCE + const_prop + copy_prop *)
+(* def/uses accessors for coalescing *)
+let tac_def = function
+  | TConst(r,_)|TBinop(r,_,_,_)|TBinopImm(r,_,_,_)|TUnop(r,_,_)|TCopy(r,_)
+  | TLoad(r,_,_)|TLa(r,_)|TCall(r,_,_) -> Some r
+  | TStore _|TCallVoid _ -> None
+
+let tac_uses = function
+  | TBinop(_,_,a,b) -> [a;b]
+  | TBinopImm(_,_,a,_) -> [a]
+  | TUnop(_,_,a) | TCopy(_,a) | TLoad(_,a,_) -> [a]
+  | TStore(b,_,s) -> [b;s]
+  | TCall(_,_,args) | TCallVoid(_,args) -> args
+  | TConst _ | TLa _ -> []
+
+let retarget_dest instr v = match instr with
+  | TConst(_,n) -> TConst(v,n) | TBinop(_,op,a,b) -> TBinop(v,op,a,b)
+  | TBinopImm(_,op,a,n) -> TBinopImm(v,op,a,n)
+  | TUnop(_,op,a) -> TUnop(v,op,a) | TCopy(_,s) -> TCopy(v,s)
+  | TLoad(_,b,o) -> TLoad(v,b,o) | TLa(_,l) -> TLa(v,l)
+  | TCall(_,f,args) -> TCall(v,f,args) | x -> x
+
+(** Copy coalescing: `DEF t; TCopy(v,t)` with t dead afterwards → `DEF v`.
+    Removes the redundant moves mem2reg introduces on every var update. *)
+let coalesce_func blocks =
+  let live_in = compute_liveness blocks in
+  List.map (fun b ->
+    let live_out = term_live_out live_in b.term in
+    let arr = Array.of_list b.body in
+    let n = Array.length arr in
+    let used_from k r =
+      let rec go i =
+        if i >= n then List.mem r live_out
+        else if List.mem r (tac_uses arr.(i)) then true else go (i+1)
+      in go k in
+    let out = ref [] and i = ref 0 in
+    while !i < n do
+      (match (if !i+1 < n then Some arr.(!i+1) else None), tac_def arr.(!i) with
+       | Some (TCopy (v, t')), Some t
+         when t = t' && t >= 18 && v >= 18 && v <> t && not (used_from (!i+2) t) ->
+         out := retarget_dest arr.(!i) v :: !out; i := !i + 2
+       | _ -> out := arr.(!i) :: !out; incr i)
+    done;
+    { b with body = List.rev !out }
+  ) blocks
+
+(** Jump threading: bypass empty blocks whose only content is `TJump t`.
+    Redirect every terminator edge through such forwarders, then drop the
+    now-unreferenced forwarder blocks (keeping the entry). Safe, reduces the
+    many trivial `Lx: j Ly` blocks produced by if/while/short-circuit. *)
+let thread_jumps (fn : func_cfg) : func_cfg =
+  let fwd = Hashtbl.create 32 in
+  List.iter (fun b -> match b.body, b.term with
+    | [], TJump t when t <> b.label -> Hashtbl.replace fwd b.label t
+    | _ -> ()) fn.blocks;
+  let rec resolve l seen =
+    if List.mem l seen then l
+    else match Hashtbl.find_opt fwd l with
+      | Some t -> resolve t (l :: seen)
+      | None -> l in
+  let fix l = resolve l [] in
+  let blocks = List.map (fun b ->
+    let term = match b.term with
+      | TJump l -> TJump (fix l)
+      | TBranch (r, l1, l2) -> TBranch (r, fix l1, fix l2)
+      | TReturn _ as t -> t in
+    { b with term }) fn.blocks in
+  (* keep entry and any non-forwarder block; forwarders are now bypassed *)
+  let blocks = List.filter (fun b ->
+    b.label = fn.entry || not (Hashtbl.mem fwd b.label)) blocks in
+  { fn with blocks }
+
+(** Immediate folding: fuse a small constant operand into the op.
+    Turns `TConst(c,n); TBinop(r,Add,x,c)` into `TBinopImm(r,Add,x,n)` (later
+    lowered to addi/slti), so loop-invariant `li` for the constant is dropped by
+    DCE. Position-sensitive forward scan (a temp reg may be reloaded). *)
+let in_imm12 n = n >= -2048 && n <= 2047
+let fold_imm_block blk =
+  let cst = Hashtbl.create 16 in
+  let getc r = Hashtbl.find_opt cst r in
+  let body = List.map (fun instr ->
+    let out = match instr with
+      | TBinop (r, Add, a, b) ->
+        (match getc b with
+         | Some n when in_imm12 n -> TBinopImm (r, Add, a, n)
+         | _ -> (match getc a with
+                 | Some n when in_imm12 n -> TBinopImm (r, Add, b, n)
+                 | _ -> instr))
+      | TBinop (r, Sub, a, b) ->
+        (match getc b with
+         | Some n when in_imm12 (-n) -> TBinopImm (r, Add, a, -n)
+         | _ -> instr)
+      | TBinop (r, Lt, a, b) ->
+        (match getc b with
+         | Some n when in_imm12 n -> TBinopImm (r, Lt, a, n)
+         | _ -> instr)
+      | _ -> instr in
+    (match instr with
+     | TConst (r, n) -> Hashtbl.replace cst r n
+     | _ -> (match tac_def instr with Some d -> Hashtbl.remove cst d | None -> ()));
+    out) blk.body in
+  { blk with body }
+
 let optimize_func (fn : func_cfg) : func_cfg =
   let blks = ref fn.blocks in
   blks := dce_function !blks;
   blks := List.map const_prop_block !blks;
   blks := List.map copy_prop_block !blks;
+  blks := List.map fold_imm_block !blks;
+  blks := coalesce_func !blks;
   blks := dce_function !blks;
-  { fn with blocks = !blks }
+  thread_jumps { fn with blocks = !blks }
 
 let optimize_program (prog : program_cfg) : program_cfg =
   { prog with functions = List.map optimize_func prog.functions }
