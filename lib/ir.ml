@@ -78,7 +78,7 @@ let lower_func (fn : Cfg.func_cfg) (is_main : bool) : ir_func =
   { name = fn.name; blocks; num_vregs = Util.get_reg_count(); is_main }
 
 let lower_program (prog : Cfg.program_cfg) : program =
-  { functions = List.map (fun f -> lower_func f false) prog.functions;
+  { functions = List.map (fun f -> lower_func f (f.name = "main")) prog.functions;
     globals = prog.globals }
 
 (* --- Register allocation --- *)

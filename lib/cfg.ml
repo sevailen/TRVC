@@ -135,9 +135,29 @@ let get_stack_slot (st : builder_state) (name : string) : int =
 (*  Expression builder                                               *)
 (* ================================================================= *)
 
+(** Check if expression is pure (no function calls) *)
+let rec is_pure = function
+  | Call _ | Assign _ -> false
+  | Binop (_, e1, e2) -> is_pure e1 && is_pure e2
+  | Unop (_, e1) -> is_pure e1
+  | _ -> true
+
 let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) : reg =
   match e with
-  | IntLit _ | Unop _ -> emit_pure st env e
+  | IntLit _ | Unop _ ->
+    let vars = ref [] in
+    let rec find_vars = function
+      | Var x -> if not (List.mem x !vars) then vars := x :: !vars
+      | Unop (_, e1) -> find_vars e1 | Binop (_, e1, e2) -> find_vars e1; find_vars e2
+      | _ -> () in
+    find_vars e;
+    let env' = List.fold_left (fun acc v ->
+      if List.mem_assoc v acc then acc else
+      let slot = try get_stack_slot st v with Failure _ -> failwith ("undeclared: " ^ v) in
+      let r = Util.fresh_reg () in
+      emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
+      (v, r) :: acc) env !vars in
+    emit_pure st env' e
   | Var x ->
     (match List.assoc_opt x env with
      | Some r -> r
@@ -149,50 +169,70 @@ let rec build_expr (st : builder_state) (env : (string * reg) list) (e : expr) :
   | Binop (And, e1, e2) ->
     let r1 = build_expr st env e1 in
     let r = Util.fresh_reg () in
-    let right_lbl = fresh_label st in let end_lbl = fresh_label st in
+    let right_lbl = fresh_label st in
+    let false_lbl = fresh_label st in
+    let merge_lbl = fresh_label st in
     emit_tac st (TCopy (r, r1));
-    finish_block st (TBranch (r1, right_lbl, end_lbl));
-    start_new_block st end_lbl;
+    finish_block st (TBranch (r1, right_lbl, false_lbl));
+    (* false_lbl: r = 0 *)
+    start_new_block st false_lbl;
     emit_tac st (TConst (r, 0));
-    finish_block st (TJump end_lbl);
+    finish_block st (TJump merge_lbl);
+    (* right_lbl: evaluate e2 *)
     start_new_block st right_lbl;
     let r2 = build_expr st env e2 in
-    emit_tac st (TBinop (r, Ne, r2, r2));
-    emit_tac st (TCopy (r, r));
-    finish_block st (TJump end_lbl);
-    start_new_block st end_lbl; r
+    let zero = Util.fresh_reg () in
+    emit_tac st (TConst (zero, 0));
+    emit_tac st (TBinop (r, Ne, r2, zero));
+    finish_block st (TJump merge_lbl);
+    (* merge *)
+    start_new_block st merge_lbl; r
   | Binop (Or, e1, e2) ->
     let r1 = build_expr st env e1 in
     let r = Util.fresh_reg () in
-    let right_lbl = fresh_label st in let end_lbl = fresh_label st in
+    let right_lbl = fresh_label st in
+    let true_lbl = fresh_label st in
+    let merge_lbl = fresh_label st in
     emit_tac st (TCopy (r, r1));
-    finish_block st (TBranch (r1, end_lbl, right_lbl));
-    start_new_block st end_lbl;
+    finish_block st (TBranch (r1, true_lbl, right_lbl));
+    (* true_lbl: r = 1 *)
+    start_new_block st true_lbl;
     emit_tac st (TConst (r, 1));
-    finish_block st (TJump end_lbl);
+    finish_block st (TJump merge_lbl);
+    (* right_lbl: evaluate e2 *)
     start_new_block st right_lbl;
     let r2 = build_expr st env e2 in
-    emit_tac st (TBinop (r, Ne, r2, r2));
-    emit_tac st (TCopy (r, r));
-    finish_block st (TJump end_lbl);
-    start_new_block st end_lbl; r
-  | Binop _ ->
-    (* Resolve stack vars in expression *)
-    let vars = ref [] in
-    let rec find_vars = function
-      | IntLit _ -> ()
-      | Var x -> if not (List.mem x !vars) then vars := x :: !vars
-      | Unop (_, e1) -> find_vars e1
-      | Binop (_, e1, e2) -> find_vars e1; find_vars e2
-      | _ -> () in
-    find_vars e;
-    let env' = List.fold_left (fun acc v ->
-      if List.mem_assoc v acc then acc else
-      let slot = get_stack_slot st v in
+    let zero = Util.fresh_reg () in
+    emit_tac st (TConst (zero, 0));
+    emit_tac st (TBinop (r, Ne, r2, zero));
+    finish_block st (TJump merge_lbl);
+    (* merge *)
+    start_new_block st merge_lbl; r
+  | Binop (op, e1, e2) ->
+    (* If expression contains function calls, evaluate subexprs manually *)
+    if not (is_pure e1) || not (is_pure e2) then begin
+      let r1 = build_expr st env e1 in
+      let r2 = build_expr st env e2 in
       let r = Util.fresh_reg () in
-      emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
-      (v, r) :: acc) env !vars in
-    emit_pure st env' e
+      emit_tac st (TBinop (r, op, r1, r2));
+      r
+    end else begin
+      let vars = ref [] in
+      let rec find_vars = function
+        | IntLit _ -> ()
+        | Var x -> if not (List.mem x !vars) then vars := x :: !vars
+        | Unop (_, e1) -> find_vars e1
+        | Binop (_, e1, e2) -> find_vars e1; find_vars e2
+        | _ -> () in
+      find_vars e;
+      let env' = List.fold_left (fun acc v ->
+        if List.mem_assoc v acc then acc else
+        let slot = get_stack_slot st v in
+        let r = Util.fresh_reg () in
+        emit_tac st (TLoad (r, 8(*fp/s0*), -4 * (slot + 1)));
+        (v, r) :: acc) env !vars in
+      emit_pure st env' e
+    end
   | Call (f, args) ->
     let arg_regs = List.map (build_expr st env) args in
     let r = Util.fresh_reg () in
