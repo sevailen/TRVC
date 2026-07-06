@@ -1,0 +1,1 @@
+let f = fun x -> let a = x + 1 in let b = x + 1 in a + b in f 5

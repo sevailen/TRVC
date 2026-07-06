@@ -1,0 +1,21 @@
+# Dune build output
+_build/
+
+# OCaml compiled files
+*.cmo
+*.cmi
+*.cmx
+*.o
+*.a
+*.so
+
+# Generated parser/lexer files (if using ocamllex/ocamlyacc)
+*.ml.ml
+*.mli.ml
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

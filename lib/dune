@@ -1,0 +1,7 @@
+(library
+ (name toylib)
+ (modules ast lexer parser util symbol semant dag cfg ssa ir codegen))
+
+(ocamllex lexer)
+(menhir
+ (modules parser))

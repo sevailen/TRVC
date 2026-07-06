@@ -1,0 +1,5 @@
+(executable
+ (public_name toyc)
+ (name main)
+ (modules main)
+ (libraries toylib))
