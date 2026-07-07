@@ -34,11 +34,33 @@ let intern dag n =
 let get dag i = dag.nodes.(i)
 let count dag = dag.count
 
-(** Eval constant binop *)
+(** Truncate OCaml int to 32-bit signed (C/RV32 semantics). *)
+let wrap32 n =
+  let n = n land 0xFFFFFFFF in
+  if n >= 0x80000000 then n - 0x100000000 else n
+
+(** C-style truncate-toward-zero division (OCaml / rounds toward -inf). *)
+let c_div a b =
+  let q = a / b in
+  let r = a mod b in
+  if r = 0 then q
+  else if (a >= 0) = (b >= 0) then q
+  else q + 1
+
+(** C-style truncated remainder. *)
+let c_mod a b =
+  let r = a mod b in
+  if r = 0 then 0
+  else if (a >= 0) = (b >= 0) then r
+  else r - b
+
+(** Eval constant binop with 32-bit signed semantics. *)
 let eval_const_binop op a b = match op with
-  | Add -> a+b | Sub -> a-b | Mul -> a*b
-  | Div -> if b=0 then failwith "div0" else a/b
-  | Mod -> if b=0 then failwith "mod0" else a mod b
+  | Add -> wrap32 (a + b)
+  | Sub -> wrap32 (a - b)
+  | Mul -> wrap32 (a * b)
+  | Div -> if b=0 then failwith "div0" else wrap32 (c_div a b)
+  | Mod -> if b=0 then failwith "mod0" else wrap32 (c_mod a b)
   | Lt -> if a<b then 1 else 0 | Gt -> if a>b then 1 else 0
   | Le -> if a<=b then 1 else 0 | Ge -> if a>=b then 1 else 0
   | Eq -> if a=b then 1 else 0 | Ne -> if a<>b then 1 else 0

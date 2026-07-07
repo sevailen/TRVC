@@ -1,0 +1,19 @@
+const int BASE = 100;
+const int MULT = 3;
+const int ADD = 7;
+const int DIV = 5;
+
+int compute(int x) {
+    return (x * MULT + ADD) / DIV;
+}
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1000) {
+        int v = compute(i);
+        sum = sum + v;
+        i = i + 1;
+    }
+    return sum % 256;
+}

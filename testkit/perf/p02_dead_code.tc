@@ -1,0 +1,28 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1000) {
+        sum = sum + (i % 10);
+
+        int d1 = i * i;
+        int d2 = (d1 * d1) / (i + 1);
+        int d3 = d2 + d1 + i;
+        int j = 0;
+        while (j < 100) {
+            int d4 = j * d3;
+            d1 = d1 + d4;
+            j = j + 1;
+        }
+        int d5 = d1 % 500;
+        int d6 = (d5 * d2) % 300;
+        int d7 = d6 + d5 - d3;
+        int k = 0;
+        while (k < 200) {
+            d7 = d7 + k;
+            k = k + 1;
+        }
+
+        i = i + 1;
+    }
+    return sum % 256;
+}

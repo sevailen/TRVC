@@ -1,0 +1,18 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1000) {
+        int a = i;
+        int b = a; int c = b; int d = c; int e = d;
+        int f = e; int g = f; int h = g; int ii = h;
+        int j = ii; int k = j; int l = k; int m = l;
+        int n = m; int o = n; int p = o; int q = p;
+        sum = sum + q;
+        int r = q; int s = r; int t = s; int u = t;
+        int v = u; int w = v; int x = w; int y = x;
+        int z = y;
+        sum = sum + z;
+        i = i + 1;
+    }
+    return sum % 256;
+}

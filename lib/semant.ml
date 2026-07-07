@@ -31,9 +31,11 @@ let rec eval_const (st : Symbol.t) (e : expr) : int =
 
 and eval_const_binop (op : binop) (a : int) (b : int) : int =
   match op with
-  | Add -> a + b | Sub -> a - b | Mul -> a * b
-  | Div -> if b = 0 then semant_error "division by zero" else a / b
-  | Mod -> if b = 0 then semant_error "modulo by zero" else a mod b
+  | Add -> Dag.wrap32 (a + b)
+  | Sub -> Dag.wrap32 (a - b)
+  | Mul -> Dag.wrap32 (a * b)
+  | Div -> if b = 0 then semant_error "division by zero" else Dag.wrap32 (Dag.c_div a b)
+  | Mod -> if b = 0 then semant_error "modulo by zero" else Dag.wrap32 (Dag.c_mod a b)
   | Lt -> if a < b then 1 else 0
   | Gt -> if a > b then 1 else 0
   | Le -> if a <= b then 1 else 0
