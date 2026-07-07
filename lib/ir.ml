@@ -159,12 +159,18 @@ let allocate fn =
   (* label -> block index *)
   let lbl2idx = Hashtbl.create 64 in
   Array.iteri (fun i b -> Hashtbl.replace lbl2idx b.label i) blocks;
-  (* successors of each block, from J/Bnez/Beqz targets that name a real block *)
-  let succ = Array.map (fun b ->
-    List.fold_left (fun acc ins -> match ins with
+  (* successors: explicit J/Bnez/Beqz targets, PLUS fall-through to the next
+     block when this block has no trailing unconditional jump (drop_fallthrough
+     may have removed a `J next`). Ret/J-terminated blocks do not fall through. *)
+  let succ = Array.mapi (fun i b ->
+    let explicit = List.fold_left (fun acc ins -> match ins with
       | J l | Bnez(_,l) | Beqz(_,l) ->
         (match Hashtbl.find_opt lbl2idx l with Some j -> j :: acc | None -> acc)
-      | _ -> acc) [] b.instrs) blocks in
+      | _ -> acc) [] b.instrs in
+    let ends_uncond = match List.rev b.instrs with
+      | (J _ | Ret) :: _ -> true | _ -> false in
+    if (not ends_uncond) && i + 1 < nb then (i+1) :: explicit else explicit
+  ) blocks in
   (* def/use sets per block (only vregs >=18), computed backward *)
   let flt l = IS.of_list (List.filter (fun r -> r >= 18) l) in
   let bdef = Array.make nb IS.empty and buse = Array.make nb IS.empty in

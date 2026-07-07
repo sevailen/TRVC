@@ -1,0 +1,8 @@
+int abs(int x){ if(x < 0){ return -x; } return x; }
+int max(int a, int b){ if(a > b){ return a; } return b; }
+int main(){
+  int a = abs(-7);
+  int b = max(a * 2, 10);
+  int c = abs(b - 20) + max(a, b);
+  return c;
+}

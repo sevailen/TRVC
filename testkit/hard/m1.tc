@@ -1,0 +1,7 @@
+int fn0(int p0,int p1,int p2){
+  return (p1 || p2) - (p1 + p0);
+}
+int fn1(int p0){
+  return (fn0(fn0(p0,-2,1),p0,p0) || p0);
+}
+int main(){ return fn1(6); }

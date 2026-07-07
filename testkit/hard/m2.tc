@@ -1,0 +1,6 @@
+int add3(int a,int b,int c){ return a + b + c; }
+int main(){
+  int x = 5;
+  int y = add3(x, x, x) || x;
+  return y + x;
+}

@@ -1,0 +1,10 @@
+int fn0(int p0){
+  if((-13 + p0)){ return (4 * 5); }
+}
+int fn1(int p0,int p1){
+}
+int fn2(int p0,int p1,int p2,int p3){
+  int v0 = (fn0(p2) || 12);
+  return (-9 < p3);
+}
+int main(){ return fn2(0,6,2,1); }
