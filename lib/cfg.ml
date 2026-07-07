@@ -63,11 +63,14 @@ let process_one_group (items : (reg * expr * (string * reg) list) list) : tac li
       | Dag.DVar x -> Dag.intern folded (Dag.DVar x)
       | Dag.DBinop (op,l,r) ->
         let nl = mapping.(l) in let nr = mapping.(r) in
-        (match Dag.get folded nl, Dag.get folded nr with
-         | Dag.DConst a, Dag.DConst b ->
-           let v = Dag.eval_const_binop op a b in
-           Dag.intern folded (Dag.DConst v)
-         | _ -> Dag.intern folded (Dag.DBinop(op,nl,nr))))
+        (match Dag.try_simplify folded op nl nr with
+         | Some id -> id
+         | None ->
+           match Dag.get folded nl, Dag.get folded nr with
+           | Dag.DConst a, Dag.DConst b ->
+             let v = Dag.eval_const_binop op a b in
+             Dag.intern folded (Dag.DConst v)
+           | _ -> Dag.intern folded (Dag.DBinop(op,nl,nr))))
   done;
   let folded_roots = List.map (fun (id,reg,env) -> (mapping.(id), reg, env)) roots in
   List.map of_dag_tac (Dag.flatten_roots folded folded_roots)
@@ -164,7 +167,7 @@ let rec eval_const_b (st : builder_state) (e : expr) : int =
     (match resolve st x with
      | Some (ConstB n) -> n
      | _ -> failwith ("Semantic error: undefined variable '" ^ x ^ "'"))
-  | Unop (Neg, e1) -> - (eval_const_b st e1)
+  | Unop (Neg, e1) -> Dag.wrap32 (- (eval_const_b st e1))
   | Unop (Not, e1) -> if eval_const_b st e1 = 0 then 1 else 0
   | Unop (Pos, e1) -> eval_const_b st e1
   | Binop (op, e1, e2) -> Dag.eval_const_binop op (eval_const_b st e1) (eval_const_b st e2)
@@ -613,6 +616,215 @@ let thread_jumps (fn : func_cfg) : func_cfg =
     b.label = fn.entry || not (Hashtbl.mem fwd b.label)) blocks in
   { fn with blocks }
 
+(* ================================================================= *)
+(*  Global dataflow: predecessors                                     *)
+(* ================================================================= *)
+
+(** Build predecessor map for blocks. *)
+let compute_preds blocks =
+  let preds = Hashtbl.create 16 in
+  List.iter (fun b -> Hashtbl.replace preds b.label []) blocks;
+  List.iter (fun b ->
+    let add l =
+      let ps = Hashtbl.find preds l in
+      if not (List.mem b.label ps) then Hashtbl.replace preds l (b.label :: ps)
+    in
+    match b.term with
+    | TJump l -> add l
+    | TBranch (_, l1, l2) -> add l1; add l2
+    | TReturn _ -> ()
+  ) blocks;
+  (fun lbl -> try Hashtbl.find preds lbl with _ -> [])
+
+(* ================================================================= *)
+(*  Global constant propagation (iterative dataflow)                  *)
+(* ================================================================= *)
+
+(** Constant propagate a block, accepting an initial seed table (reg -> int).
+    Returns updated block and the outgoing constant table. *)
+let const_prop_block_seeded blk (consts : (int, int) Hashtbl.t) =
+  let lookup r = Hashtbl.find_opt consts r in
+  let body = List.map (fun instr -> match instr with
+    | TConst(r,n) -> Hashtbl.replace consts r n; instr
+    | TCopy(r,rs) ->
+      (match lookup rs with Some v -> Hashtbl.replace consts r v | None -> Hashtbl.remove consts r); instr
+    | TBinop(r,op,r1,r2) ->
+      (match lookup r1, lookup r2 with
+       | Some a, Some b ->
+         (try let v = Dag.eval_const_binop op a b in
+          Hashtbl.replace consts r v; TConst(r,v)
+          with Failure _ -> Hashtbl.remove consts r; instr)
+       | _ -> Hashtbl.remove consts r; instr)
+    | TUnop(r,op,r1) ->
+      (match lookup r1 with
+       | Some a ->
+         (try let v = match op with Neg -> Dag.wrap32 (-a) | Not -> if a=0 then 1 else 0 | Pos -> a in
+          Hashtbl.replace consts r v; TConst(r,v)
+          with Failure _ -> Hashtbl.remove consts r; instr)
+       | _ -> Hashtbl.remove consts r; instr)
+    | TBinopImm(r,op,r1,n) ->
+      (match lookup r1 with
+       | Some a ->
+         (try let v = Dag.eval_const_binop op a n in
+          Hashtbl.replace consts r v; TConst(r,v)
+          with Failure _ -> Hashtbl.remove consts r; instr)
+       | _ -> Hashtbl.remove consts r; instr)
+    | TLoad(r,_,_) -> Hashtbl.remove consts r; instr
+    | TCall(r,_,_) -> Hashtbl.remove consts r; instr
+    | TLa(r,_) -> Hashtbl.remove consts r; instr
+    | _ -> instr) blk.body in
+  let term = match blk.term with
+    | TBranch(r,l1,l2) ->
+      (match lookup r with Some 0 -> TJump l2 | Some _ -> TJump l1 | None -> blk.term)
+    | _ -> blk.term in
+  ({blk with body; term}, consts)
+
+let global_const_prop blocks =
+  let preds = compute_preds blocks in
+  (* out_maps: label -> (reg, int) Hashtbl *)
+  let out_maps = Hashtbl.create 16 in
+  List.iter (fun b ->
+    Hashtbl.replace out_maps b.label (Hashtbl.create 16)
+  ) blocks;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (fun b ->
+      (* Compute incoming constants: intersection of all predecessors' out sets *)
+      let incoming = Hashtbl.create 16 in
+      let pl = preds b.label in
+      if pl <> [] then begin
+        (* Start with the first predecessor's out map *)
+        let first_map = Hashtbl.find out_maps (List.hd pl) in
+        Hashtbl.iter (fun k v -> Hashtbl.replace incoming k v) first_map;
+        (* Intersect with remaining predecessors *)
+        List.iter (fun p ->
+          let p_map = Hashtbl.find out_maps p in
+          Hashtbl.filter_map_inplace (fun k v ->
+            match Hashtbl.find_opt p_map k with
+            | Some v' when v' = v -> Some v'
+            | _ -> None
+          ) incoming
+        ) (List.tl pl)
+      end;
+      let _new_blk, _ = const_prop_block_seeded b incoming in
+      let old_map = Hashtbl.find out_maps b.label in
+      (* Check if out map changed *)
+      let map_changed = ref false in
+      Hashtbl.iter (fun k v ->
+        match Hashtbl.find_opt old_map k with
+        | Some v' when v' = v -> ()
+        | _ -> map_changed := true
+      ) incoming;
+      Hashtbl.iter (fun k _ ->
+        if not (Hashtbl.mem incoming k) then map_changed := true
+      ) old_map;
+      if !map_changed then begin
+        changed := true;
+        Hashtbl.replace out_maps b.label incoming
+      end
+    ) blocks
+  done;
+  (* Re-apply constant propagation with final incoming sets *)
+  List.map (fun b ->
+    let pl = preds b.label in
+    let incoming = Hashtbl.create 16 in
+    if pl <> [] then begin
+      let first_map = Hashtbl.find out_maps (List.hd pl) in
+      Hashtbl.iter (fun k v -> Hashtbl.replace incoming k v) first_map;
+      List.iter (fun p ->
+        let p_map = Hashtbl.find out_maps p in
+        Hashtbl.filter_map_inplace (fun k _ ->
+          match Hashtbl.find_opt p_map k with Some v' -> Some v' | None -> None
+        ) incoming
+      ) (List.tl pl)
+    end;
+    fst (const_prop_block_seeded b incoming)
+  ) blocks
+
+(* ================================================================= *)
+(*  Global copy propagation (iterative dataflow)                      *)
+(* ================================================================= *)
+
+(** Copy-propagate a block with an initial seed copy table. *)
+let copy_prop_block_seeded blk copies =
+  let subst r = match Hashtbl.find_opt copies r with Some r'->r' | None->r in
+  let body = List.map (fun instr ->
+    match instr with
+    | TCopy(r,rs) -> Hashtbl.replace copies r (subst rs); instr
+    | _ ->
+      (match instr with
+       | TConst(r,_)|TUnop(r,_,_)|TBinop(r,_,_,_)|TBinopImm(r,_,_,_)
+       | TLoad(r,_,_)|TCall(r,_,_)|TLa(r,_) -> Hashtbl.remove copies r | _ -> ());
+      match instr with
+      | TBinop(r,op,r1,r2) -> TBinop(r,op,subst r1,subst r2)
+      | TBinopImm(r,op,r1,n) -> TBinopImm(r,op,subst r1,n)
+      | TUnop(r,op,r1) -> TUnop(r,op,subst r1)
+      | TStore(rb,off,rs) -> TStore(subst rb,off,subst rs)
+      | TCall(r,f,args) -> TCall(r,f,List.map subst args)
+      | TCallVoid(f,args) -> TCallVoid(f,List.map subst args)
+      | _ -> instr) blk.body in
+  let term = match blk.term with
+    | TBranch(r,l1,l2) -> TBranch((subst r),l1,l2)
+    | TReturn(Some r) -> TReturn(Some (subst r))
+    | _ -> blk.term in
+  ({blk with body; term}, copies)
+
+let global_copy_prop blocks =
+  let preds = compute_preds blocks in
+  let out_maps = Hashtbl.create 16 in
+  List.iter (fun b ->
+    Hashtbl.replace out_maps b.label (Hashtbl.create 16)
+  ) blocks;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (fun b ->
+      let incoming = Hashtbl.create 16 in
+      let pl = preds b.label in
+      if pl <> [] then begin
+        let first_map = Hashtbl.find out_maps (List.hd pl) in
+        Hashtbl.iter (fun k v -> Hashtbl.replace incoming k v) first_map;
+        List.iter (fun p ->
+          let p_map = Hashtbl.find out_maps p in
+          Hashtbl.filter_map_inplace (fun k _ ->
+            match Hashtbl.find_opt p_map k with Some v' -> Some v' | None -> None
+          ) incoming
+        ) (List.tl pl)
+      end;
+      let (_ : block) = fst (copy_prop_block_seeded b incoming) in
+      let old_map = Hashtbl.find out_maps b.label in
+      let map_changed = ref false in
+      Hashtbl.iter (fun k v ->
+        match Hashtbl.find_opt old_map k with
+        | Some v' when v' = v -> ()
+        | _ -> map_changed := true
+      ) incoming;
+      Hashtbl.iter (fun k _ ->
+        if not (Hashtbl.mem incoming k) then map_changed := true
+      ) old_map;
+      if !map_changed then begin
+        changed := true;
+        Hashtbl.replace out_maps b.label incoming
+      end
+    ) blocks
+  done;
+  List.map (fun b ->
+    let pl = preds b.label in
+    let incoming = Hashtbl.create 16 in
+    if pl <> [] then begin
+      let first_map = Hashtbl.find out_maps (List.hd pl) in
+      Hashtbl.iter (fun k v -> Hashtbl.replace incoming k v) first_map;
+      List.iter (fun p ->
+        let p_map = Hashtbl.find out_maps p in
+        Hashtbl.filter_map_inplace (fun k _ ->
+          match Hashtbl.find_opt p_map k with Some v' -> Some v' | None -> None
+        ) incoming
+      ) (List.tl pl)
+    end;
+    fst (copy_prop_block_seeded b incoming)
+  ) blocks
+
 (** Immediate folding: fuse a small constant operand into the op.
     Turns `TConst(c,n); TBinop(r,Add,x,c)` into `TBinopImm(r,Add,x,n)` (later
     lowered to addi/slti), so loop-invariant `li` for the constant is dropped by
@@ -644,15 +856,232 @@ let fold_imm_block blk =
     out) blk.body in
   { blk with body }
 
+(* ================================================================= *)
+(*  Loop Invariant Code Motion (LICM)                                 *)
+(* ================================================================= *)
+
+(** Compute Reverse PostOrder numbers for blocks.
+    Entry block always has RPO 1. Back edges go from higher RPO to lower RPO. *)
+let compute_rpo blocks : (label, int) Hashtbl.t =
+  let succs = Hashtbl.create 16 in
+  List.iter (fun b ->
+    let add l = 
+      let prev = try Hashtbl.find succs b.label with _ -> [] in
+      Hashtbl.replace succs b.label (l :: prev)
+    in
+    match b.term with
+    | TJump l -> add l
+    | TBranch (_, l1, l2) -> add l1; add l2
+    | TReturn _ -> ()
+  ) blocks;
+  (* DFS postorder, then reverse *)
+  let visited = Hashtbl.create 16 in
+  let postorder = ref [] in
+  let rec dfs lbl =
+    if Hashtbl.mem visited lbl then () else begin
+      Hashtbl.replace visited lbl ();
+      List.iter dfs (try Hashtbl.find succs lbl with _ -> []);
+      postorder := lbl :: !postorder
+    end
+  in
+  let entry = (List.hd blocks).label in
+  dfs entry;
+  (* Now assign RPO numbers: reverse postorder = 1, 2, 3, ... *)
+  let rpo = Hashtbl.create 16 in
+  List.iteri (fun i lbl -> Hashtbl.replace rpo lbl (i + 1)) (List.rev !postorder);
+  rpo
+
+(** Find natural loops using Reverse PostOrder.
+    A back edge a → h has RPO(h) < RPO(a). Then the loop body is
+    the header plus all blocks that can reach the latch through the back edge. *)
+let find_natural_loops blocks : (label * label list) list =
+  let preds = compute_preds blocks in
+  let rpo = compute_rpo blocks in
+  let loops = ref [] in
+  (* Find back edges: check every edge a → b for b.rpo < a.rpo *)
+  List.iter (fun b ->
+    let a_lbl = b.label in
+    let a_rpo = try Hashtbl.find rpo a_lbl with _ -> 0 in
+    List.iter (fun h_lbl ->
+      let h_rpo = try Hashtbl.find rpo h_lbl with _ -> 0 in
+      if h_rpo < a_rpo then begin
+        (* Edge a → h is a back edge, h is the loop header *)
+        let body = try List.assoc h_lbl !loops with _ -> [] in
+        if not (List.mem a_lbl body) then
+          loops := (h_lbl, a_lbl :: body) :: List.remove_assoc h_lbl !loops
+      end
+    ) (preds a_lbl)
+  ) blocks;
+  (* Expand loop body: all blocks that can reach a latch without going through header *)
+  let expand_loop header body_set =
+    let expanded = ref body_set in
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      List.iter (fun l ->
+        if List.mem l !expanded then
+          List.iter (fun p ->
+            if p <> header && not (List.mem p !expanded) then begin
+              expanded := p :: !expanded; changed := true
+            end
+          ) (preds l)
+      ) !expanded
+    done;
+    header :: List.filter ((<>) header) !expanded
+  in
+  List.map (fun (h, body) -> (h, norm (expand_loop h body))) !loops
+
+(** Perform LICM on a function's blocks.
+    Moves loop-invariant instructions from loop bodies to pre-headers. *)
+let licm_func (fn : func_cfg) : func_cfg =
+  let loops = find_natural_loops fn.blocks in
+  if loops = [] then fn else
+  (* Process each loop *)
+  let fn_ref = ref fn in
+  List.iter (fun (hdr, body) ->
+    let body_set = body in
+    let cur_blocks = !fn_ref.blocks in
+    (* Collect all regs defined INSIDE the loop (including header, since header's
+       param copies re-define registers every iteration). *)
+    let inside_defs = Hashtbl.create 16 in
+    List.iter (fun l ->
+      if List.mem l body_set then
+        let b = try List.find (fun blk -> blk.label = l) cur_blocks with _ -> failwith "block not found" in
+        List.iter (fun instr ->
+          match tac_def instr with Some r -> Hashtbl.replace inside_defs r () | None -> ()
+        ) b.body
+    ) body_set;
+    (* A reg is "loop-invariant" if it's NOT defined inside the loop body.
+       ABI registers (< 18) are never invariant — copy propagation may substitute
+       user vregs with ABI regs, but TCO or calls may redefine them inside the loop. *)
+    let is_invariant_reg r = r >= 18 && not (Hashtbl.mem inside_defs r) in
+    let () = Printf.eprintf "LICM %s: hdr=%s body=[%s] inside_defs={%s}\n%!"
+      fn.name hdr
+      (String.concat ";" body)
+      (Hashtbl.fold (fun k _ acc -> Printf.sprintf "%s%d;" acc k) inside_defs "") in
+    let inv_set = Hashtbl.create 16 in
+    let inv_instrs = ref [] in
+    (* A register operand is truly invariant if it's NOT redefined in the loop body
+       AND either already proven invariant or defined outside the loop. *)
+    let is_op_inv r =
+      if Hashtbl.mem inside_defs r then false
+      else Hashtbl.mem inv_set r || is_invariant_reg r
+    in
+    (* Iteratively find invariant instructions *)
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      List.iter (fun l ->
+        if l <> hdr && List.mem l body_set then
+          let b = try List.find (fun blk -> blk.label = l) cur_blocks with _ -> failwith "block not found" in
+          List.iter (fun instr ->
+            let r_opt = tac_def instr in
+            match r_opt with
+            | Some r when not (Hashtbl.mem inv_set r) ->
+              let is_inv = match instr with
+                | TConst _ -> not (Hashtbl.mem inside_defs r)
+                | TCopy (_, rs) -> is_op_inv rs
+                | TBinop (_, _, r1, r2) -> is_op_inv r1 && is_op_inv r2
+                | TBinopImm (_, _, r1, _) -> is_op_inv r1
+                | TUnop (_, _, r1) -> is_op_inv r1
+                | TLoad (_, rb, _) -> is_op_inv rb
+                | TCall _ | TCallVoid _ | TStore _ | TLa _ -> false
+              in
+              if is_inv then begin
+                Hashtbl.replace inv_set r ();
+                inv_instrs := (l, instr) :: !inv_instrs;
+                changed := true
+              end
+            | _ -> ()
+          ) b.body
+      ) body_set
+    done;
+    if !inv_instrs <> [] then begin
+      let pre_hdr_lbl = hdr ^ "_ph" in
+      let preds_func = compute_preds cur_blocks in
+      let preds_hdr = preds_func hdr in
+      let outside_preds = List.filter (fun p -> not (List.mem p body_set)) preds_hdr in
+      (* Build pre-header block *)
+      let pre_hdr_body = List.rev_map snd !inv_instrs in
+      let pre_hdr_blk = { label = pre_hdr_lbl; body = pre_hdr_body; term = TJump hdr } in
+      (* Redirect outside preds to pre-header *)
+      let updated = List.map (fun b ->
+        let term = match b.term with
+          | TJump l when l = hdr && List.mem b.label outside_preds -> TJump pre_hdr_lbl
+          | TBranch (r, l1, l2) ->
+            let l1' = if l1 = hdr && List.mem b.label outside_preds then pre_hdr_lbl else l1 in
+            let l2' = if l2 = hdr && List.mem b.label outside_preds then pre_hdr_lbl else l2 in
+            if l1' <> l1 || l2' <> l2 then TBranch (r, l1', l2') else b.term
+          | _ -> b.term in
+        { b with term }
+      ) cur_blocks in
+      (* Remove hoisted instructions from original blocks *)
+      let hoist_map = Hashtbl.create 16 in
+      List.iter (fun (lbl, instr) ->
+        let prev = try Hashtbl.find hoist_map lbl with _ -> [] in
+        Hashtbl.replace hoist_map lbl (instr :: prev)
+      ) !inv_instrs;
+      let updated = List.map (fun b ->
+        let to_remove = try Hashtbl.find hoist_map b.label with _ -> [] in
+        if to_remove = [] then b else
+        { b with body = List.filter (fun instr -> not (List.mem instr to_remove)) b.body }
+      ) updated in
+      fn_ref := { !fn_ref with blocks = pre_hdr_blk :: updated }
+    end
+  ) loops;
+  !fn_ref
+
+(* ================================================================= *)
+(*  Tail Call Optimization (TCO)                                      *)
+(* ================================================================= *)
+
+(** Detect and convert self-recursive tail calls into jumps.
+    When a block ends with `TCall(r, self_name, args)` followed by
+    `TReturn(Some r)`, replace with moves to param regs and a jump
+    to the entry block, eliminating the call/ret overhead. *)
+let tco_func (fn : func_cfg) : func_cfg =
+  let entry = fn.entry in
+  let name = fn.name in
+  let blocks = List.map (fun blk ->
+    match blk.term with
+    | TReturn (Some ret_reg) ->
+      (* Find the LAST TCall in the body whose dst matches ret_reg and target is self.
+         Walk reversed body: collect non-call instructions as we go. *)
+      let rec scan rev_rest before_call_rev =
+        match rev_rest with
+        | TCall (dst, fn_name, args) :: rest
+          when dst = ret_reg && fn_name = name ->
+          (* Found it: before_call_rev has instructs after the call (reversed);
+             rest has instructions before the call (reversed). Rebuild in order. *)
+          let before_call = List.rev rest in
+          let arg_moves = List.mapi (fun i arg ->
+            if i < 8 then TCopy (10 + i, arg)
+            else TStore (8, (i - 8) * 4, arg)
+          ) args in
+          Some (List.concat [before_call; before_call_rev; arg_moves])
+        | instr :: rest -> scan rest (instr :: before_call_rev)
+        | [] -> None
+      in
+      (match scan (List.rev blk.body) [] with
+       | Some new_body -> { blk with body = new_body; term = TJump entry }
+       | None -> blk)
+    | _ -> blk
+  ) fn.blocks in
+  { fn with blocks }
+
 let optimize_func (fn : func_cfg) : func_cfg =
   let blks = ref fn.blocks in
-  blks := dce_function !blks;
-  blks := List.map const_prop_block !blks;
-  blks := List.map copy_prop_block !blks;
-  blks := List.map fold_imm_block !blks;
-  blks := coalesce_func !blks;
-  blks := dce_function !blks;
-  thread_jumps { fn with blocks = !blks }
+  for _ = 1 to 3 do
+    blks := dce_function !blks;
+    blks := global_const_prop !blks;
+    blks := List.map copy_prop_block !blks;
+    blks := List.map fold_imm_block !blks;
+    blks := coalesce_func !blks;
+    blks := dce_function !blks;
+  done;
+  let blks = tco_func { fn with blocks = !blks } in
+  let blks = licm_func blks in
+  thread_jumps blks
 
 let optimize_program (prog : program_cfg) : program_cfg =
   { prog with functions = List.map optimize_func prog.functions }

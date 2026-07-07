@@ -1,0 +1,24 @@
+const int C1 = 1 + 2 + 3;
+const int C2 = C1 * C1 + C1 * 2 + 1;
+const int C3 = (C2 * C2 + C2) / 2;
+const int C4 = ((C3 % 100) * 100 + (C2 % 100) * 10 + (C1 % 10));
+const int C5 = C4 * C4 * C4 % 10000;
+const int C6 = 1;
+const int C7 = C6 + C6;
+const int C8 = C7 + C7;
+const int C9 = C8 + C8;
+const int C10 = C9 + C9;
+
+int main() {
+    int sum = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10;
+    int i = 0;
+    while (i < 500) {
+        int a = ((((1 + 2) * 3 + 4) * 5 + 6) * 7 + 8) * 9 + 10;
+        int b = (((((1 * 2 + 3) * 4 + 5) * 6 + 7) * 8 + 9) * 10);
+        int c = (a * a + b * b) % (a + b + 1);
+        int d = (c * c) % 1000;
+        sum = sum + d;
+        i = i + 1;
+    }
+    return sum % 256;
+}

@@ -1,0 +1,23 @@
+int tail_sum(int acc, int n) {
+    if (n == 0) { return acc; }
+    return tail_sum(acc + n, n - 1);
+}
+
+int tail_fact(int acc, int n) {
+    if (n <= 1) { return acc; }
+    return tail_fact(acc * n, n - 1);
+}
+
+int tail_gcd(int a, int b) {
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    if (a < b) { return tail_gcd(a, b % a); }
+    return tail_gcd(b, a % b);
+}
+
+int main() {
+    int s = tail_sum(0, 500);
+    int f = tail_fact(1, 10);
+    int g = tail_gcd(12345, 67890);
+    return (s + f + g) % 256;
+}

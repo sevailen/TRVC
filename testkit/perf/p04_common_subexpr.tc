@@ -1,0 +1,13 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1000) {
+        int a = i + 5;
+        int b = i * 2;
+        int c = a + b;
+        int d = a - b;
+        sum = sum + c + c + c + d + d + d;
+        i = i + 1;
+    }
+    return sum % 256;
+}

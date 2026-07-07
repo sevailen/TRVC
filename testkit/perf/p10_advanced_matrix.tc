@@ -1,0 +1,40 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 500) {
+        int a0 = i;
+        int a1 = a0 + a0;
+        int a2 = a1 + a0;
+        int a3 = a2 + a0;
+        int a4 = a3 + a0;
+        int a5 = a4 + a0;
+        int a6 = a5 + a0;
+        int a7 = a6 + a0;
+        int a8 = a7 + a0;
+        int a9 = a8 + a0;
+        int b0 = a9 + a0;
+        int b1 = b0 + a1;
+        int b2 = b1 + a2;
+        int b3 = b2 + a3;
+        int b4 = b3 + a4;
+        int b5 = b4 + a5;
+        int b6 = b5 + a6;
+        int b7 = b6 + a7;
+        int b8 = b7 + a8;
+        int b9 = b8 + a9;
+        int c0 = b9 + b0;
+        int c1 = c0 + b1;
+        int c2 = c1 + b2;
+        int c3 = c2 + b3;
+        int c4 = c3 + b4;
+        int c5 = c4 + b5;
+        int c6 = c5 + b6;
+        int c7 = c6 + b7;
+        int c8 = c7 + b8;
+        int c9 = c8 + b9;
+
+        sum = sum + c9;
+        i = i + 1;
+    }
+    return sum % 256;
+}

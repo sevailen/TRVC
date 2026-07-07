@@ -2,7 +2,7 @@
 # Run all cases/*.tc, compile+assemble+qemu, compare to .exp. Usage: all.sh [-opt]
 KIT="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$KIT/.." && pwd)"
-QEMU=/tmp/qroot/usr/bin/qemu-riscv32-static
+QEMU=/usr/bin/qemu-riscv32
 EXE="$ROOT/_build/default/bin/main.exe"
 GCC="riscv64-unknown-elf-gcc -march=rv32im -mabi=ilp32 -nostdlib -static"
 opt="${1:-}"

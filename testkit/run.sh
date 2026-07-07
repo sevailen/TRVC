@@ -4,7 +4,7 @@
 set -u
 KIT="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$KIT/.." && pwd)"
-QEMU=/tmp/qroot/usr/bin/qemu-riscv32-static
+QEMU=/usr/bin/qemu-riscv32
 EXE="$ROOT/_build/default/bin/main.exe"
 GCC="riscv64-unknown-elf-gcc -march=rv32im -mabi=ilp32 -nostdlib -static"
 

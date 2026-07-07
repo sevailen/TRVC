@@ -1,0 +1,27 @@
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int mul(int a, int b) { return a * b; }
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 200) {
+        int j = 0;
+        while (j < 100) {
+            int a = i + j;
+            int b = i - j;
+            int c = i * j;
+            int r1 = add(c, a);
+            int r2 = sub(c, a);
+            int r3 = mul(c, b);
+            int d = r1 + 0;
+            int e = d * 1;
+            int f = e + r2;
+            int dead = (r1 * r2 + r3) / (i + j + 1);
+            sum = sum + f;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return sum % 256;
+}
